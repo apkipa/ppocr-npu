@@ -8,6 +8,7 @@
 #include "wic_decoder.hpp"
 
 #include <windows.h>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -31,6 +32,8 @@ void print_usage(const char* prog) {
     std::cout << "  --rec-640 <path>       Path to Rec W=640 model [default: models/ppocrv6_small_rec_w640.xml]\n";
     std::cout << "  --dict <path>          Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
     std::cout << "  --slice                Force tiling slicing for large images\n";
+    std::cout << "  --rec-poll             Poll both rec slots for a finished request instead of fixed alternation\n";
+    std::cout << "  --rec-depth <n>        Number of in-flight rec requests per graph (default 2)\n";
     std::cout << "  --profile, -p          Print detailed end-to-end performance breakdown\n";
     std::cout << "  --help, -h             Show this help message\n";
 }
@@ -68,6 +71,8 @@ int main(int argc, char* argv[]) {
         std::string rec_640 = resolve_model("models/ppocrv6_small_rec_w640");
         std::string dict_path = "models/ppocr_keys_v1.txt";
         bool force_slice = false;
+        bool rec_poll = false;
+        int rec_depth = 2;
         ppocr::ProfileMetrics metrics;
 
         for (int i = 1; i < argc; ++i) {
@@ -88,6 +93,12 @@ int main(int argc, char* argv[]) {
                 dict_path = argv[++i];
             } else if (arg == "--slice") {
                 force_slice = true;
+            } else if (arg == "--rec-poll") {
+                rec_poll = true;
+            } else if (arg == "--rec-depth" && i + 1 < argc) {
+                rec_depth = std::atoi(argv[++i]);
+                if (rec_depth < 1) rec_depth = 1;
+                if (rec_depth > 8) rec_depth = 8;
             } else if (arg == "--profile" || arg == "-p") {
                 metrics.enabled = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -146,12 +157,12 @@ int main(int argc, char* argv[]) {
 
         // 3. Load Models
         std::cout << "[*] Loading Detection model onto NPU: " << det_model << "..." << std::endl;
-        auto det_graph = engine.load_model(det_model, 2); // 2-concurrency Ping-Pong
+        auto det_graph = engine.load_model(det_model, 2); // 2-deep tile pipeline (submit-ahead)
 
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
-        auto rec_graph_160 = fs::exists(rec_160) ? engine.load_model(rec_160, 2) : nullptr;
-        auto rec_graph_320 = fs::exists(rec_320) ? engine.load_model(rec_320, 2) : nullptr;
-        auto rec_graph_640 = fs::exists(rec_640) ? engine.load_model(rec_640, 2) : nullptr;
+        auto rec_graph_160 = fs::exists(rec_160) ? engine.load_model(rec_160, rec_depth) : nullptr;
+        auto rec_graph_320 = fs::exists(rec_320) ? engine.load_model(rec_320, rec_depth) : nullptr;
+        auto rec_graph_640 = fs::exists(rec_640) ? engine.load_model(rec_640, rec_depth) : nullptr;
 
         ppocr::CtcDecoder ctc_decoder(dict_path);
 
@@ -172,7 +183,7 @@ int main(int argc, char* argv[]) {
             float step_x = (nx > 1) ? static_cast<float>(src_image.width - tile_size) / (nx - 1) : 0.0f;
             float step_y = (ny > 1) ? static_cast<float>(src_image.height - tile_size) / (ny - 1) : 0.0f;
 
-            std::cout << "[*] Large image detected. Dispatching 2-stream NPU slicing: "
+            std::cout << "[*] Large image detected. Dispatching tiled NPU detection: "
                       << nx << "x" << ny << " = " << metrics.det_tile_count << " tiles (640x640, uniform step)...\n";
 
             struct TileTask {
@@ -192,7 +203,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Execute Ping-Pong asynchronous queue across tiles
+            // Two-slot tile pipeline: keep submitting ahead while each slot is
+            // awaited only on its own queue (device execution itself is serial)
             std::vector<std::vector<float>> tile_outputs(tasks.size(), std::vector<float>(tile_size * tile_size));
             {
                 ppocr::ScopedTimer timer(metrics.det_inference_ms);
@@ -282,6 +294,39 @@ int main(int argc, char* argv[]) {
             } else {
                 std::cout << "[*] Executing Recognition on NPU across Multi-Bucket Grid Pipeline...\n";
 
+                // Recognition pipeline: submit box b, prepare b+1, decode b-2. Each
+                // slot waits only on the request it submitted to (pooled per-slot
+                // queue), so while the host crops, normalizes and CTC-decodes, the
+                // other in-flight requests stay queued on the NPU (the device runs
+                // them serially; depth=2 keeps it busy).
+                struct PendingRec {
+                    ppocr::NpuInferRequest* req = nullptr;
+                    ppocr::TextBox* box = nullptr;
+                    int vocab_size = 0;
+                    int valid_seq_len = 0;
+                };
+                std::vector<PendingRec> pending(static_cast<size_t>(rec_depth));
+
+                auto consume_rec_slot = [&](size_t slot) {
+                    PendingRec& p = pending[slot];
+                    const uint16_t* p_out = reinterpret_cast<const uint16_t*>(p.req->get_output_ptr(0));
+                    {
+                        ppocr::ScopedTimer timer(metrics.ctc_decode_ms);
+                        p.box->text = ctc_decoder.decode(p_out, p.valid_seq_len, p.vocab_size, p.box->text_confidence);
+                    }
+                    p.req = nullptr;
+                };
+
+                auto flush_rec_slot = [&](size_t slot) {
+                    PendingRec& p = pending[slot];
+                    if (!p.req) return;
+                    {
+                        ppocr::ScopedTimer timer(metrics.rec_inference_ms);
+                        p.req->wait();
+                    }
+                    consume_rec_slot(slot);
+                };
+
                 for (size_t b = 0; b < boxes.size(); ++b) {
                     auto& box = boxes[b];
                     // Crop quad normalized to height 48, with natural uncompressed width
@@ -324,9 +369,26 @@ int main(int argc, char* argv[]) {
                             );
                         }
 
-                        // TODO(NPU parallelism): blocking per-box submit/wait serializes rec;
-                        // see npu_engine.cpp wait() TODO. Pipeline: submit box b, crop b+1, decode b-1.
-                        auto& req = target_graph->get_request(b % 2);
+                        // Default: reuse slot b%depth only after its previous submission
+                        // (box b-depth) is done; the other slots' requests are untouched.
+                        // --rec-poll (depth 2 only): consume whichever slot finished
+                        // first, then reuse that slot.
+                        size_t slot = b % static_cast<size_t>(rec_depth);
+                        if (rec_poll && rec_depth == 2) {
+                            if (pending[0].req && pending[1].req) {
+                                for (;;) {
+                                    if (pending[0].req->try_wait()) { consume_rec_slot(0); slot = 0; break; }
+                                    if (pending[1].req->try_wait()) { consume_rec_slot(1); slot = 1; break; }
+                                    Sleep(0);
+                                }
+                            } else {
+                                slot = pending[0].req ? 1 : 0;
+                            }
+                        } else {
+                            flush_rec_slot(slot);
+                        }
+
+                        auto& req = target_graph->get_request(slot);
                         ppocr::WicDecoder::normalize_to_nchw_fp16(
                             padded_crop, req.get_input_ptr(0),
                             127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
@@ -335,19 +397,19 @@ int main(int argc, char* argv[]) {
                         {
                             ppocr::ScopedTimer timer(metrics.rec_inference_ms);
                             req.start_async();
-                            req.wait();
                         }
 
-                        const uint16_t* p_rec_out = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
                         int seq_len = target_w / 8;
                         int vocab_size = static_cast<int>(target_graph->outputs()[0].total_bytes / (seq_len * 2));
-                        int valid_seq_len = std::min(seq_len, static_cast<int>(std::ceil(static_cast<float>(valid_w) / 8.0f)));
-
-                        {
-                            ppocr::ScopedTimer timer(metrics.ctc_decode_ms);
-                            box.text = ctc_decoder.decode(p_rec_out, valid_seq_len, vocab_size, box.text_confidence);
-                        }
+                        pending[slot].req = &req;
+                        pending[slot].box = &box;
+                        pending[slot].vocab_size = vocab_size;
+                        pending[slot].valid_seq_len =
+                            std::min(seq_len, static_cast<int>(std::ceil(static_cast<float>(valid_w) / 8.0f)));
                     } else {
+                        // Ultra-long lines act as a pipeline barrier: the slice loop
+                        // below reuses the 640-graph request slots.
+                        for (size_t s = 0; s < pending.size(); ++s) flush_rec_slot(s);
                         // CASE 2: Ultra-long line (> 640px) -> Grid Sliding Window with Midpoint Merging
                         const int win_w = 640;
                         const int overlap_px = 128;
@@ -426,6 +488,9 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+
+                // Flush all remaining in-flight recognition slots
+                for (size_t s = 0; s < pending.size(); ++s) flush_rec_slot(s);
             }
         }
 

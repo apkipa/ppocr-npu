@@ -30,15 +30,20 @@ void check_ze(ze_result_t result, const char* msg) {
 NpuInferRequest::NpuInferRequest(
     ze_context_handle_t context,
     ze_device_handle_t device,
-    ze_command_queue_handle_t queue,
-    uint32_t queue_ordinal,
+    QueueSlot* slot,
     ze_graph_handle_t graph,
     const std::vector<TensorDesc>& inputs,
     const std::vector<TensorDesc>& outputs,
     ze_graph_dditable_ext_t* graph_api
-) : context_(context), device_(device), queue_(queue), graph_(graph),
-    graph_api_(graph_api), input_descs_(inputs), output_descs_(outputs)
+) : context_(context), device_(device), queue_(slot->queue), graph_(graph),
+    graph_api_(graph_api), input_descs_(inputs), output_descs_(outputs), fence_(slot->fence)
 {
+    // Queue and fence are borrowed from the engine pool. Waits only drain this
+    // request's submission, which lets the host overlap crop/normalize/CTC with
+    // another in-flight request. The device still serializes command lists
+    // (verified): the queue group's two physical engines do not run requests in
+    // parallel.
+
     // Allocate USM Shared Memory for zero-copy inputs & outputs
     ze_device_mem_alloc_desc_t dev_desc{};
     dev_desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
@@ -60,7 +65,7 @@ NpuInferRequest::NpuInferRequest(
     // Create Command List
     ze_command_list_desc_t cmd_desc{};
     cmd_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
-    cmd_desc.commandQueueGroupOrdinal = queue_ordinal;
+    cmd_desc.commandQueueGroupOrdinal = slot->ordinal;
     check_ze(zeCommandListCreate(context_, device_, &cmd_desc, &command_list_), "CommandListCreate");
 
     // Bind argument pointers initially
@@ -94,24 +99,22 @@ void NpuInferRequest::start_async() {
 
     check_ze(graph_api_->pfnAppendGraphExecute(command_list_, graph_, nullptr, nullptr, 0, nullptr), "AppendGraphExecute");
     check_ze(zeCommandListClose(command_list_), "CommandListClose");
-    check_ze(zeCommandQueueExecuteCommandLists(queue_, 1, &command_list_, nullptr), "ExecuteCommandLists");
+    check_ze(zeFenceReset(fence_), "FenceReset");
+    check_ze(zeCommandQueueExecuteCommandLists(queue_, 1, &command_list_, fence_), "ExecuteCommandLists");
 }
 
-// TODO(NPU parallelism): wait() synchronizes the engine-wide shared command
-// queue instead of this request, so all outstanding work drains together.
-// Consequences measured on 2560x1524: the det tile ping-pong in main.cpp
-// degenerates to serial execution (15 tiles ~20.3ms each, no overlap) and the
-// per-box rec submit/wait never overlaps with crop/CTC decode.
-// Optimization plan:
-//   1. attach a ze_fence_t (or ze_event) per NpuInferRequest, execute the
-//      command list against that fence and wait with zeFenceHostSynchronize;
-//   2. or create one command queue per request so a wait only drains its own
-//      queue (NPU3720 is dual-tile; nireq=2 is the measured sweet spot,
-//      OpenVINO reference hits ~475 FPS rec with 2 concurrent requests);
-//   3. main.cpp: pipeline rec as "submit box b, crop box b+1, decode b-1";
-//      det tiles: submit tile i+1 before draining tile i.
+// Synchronizes this request's pooled fence, so only this request's submission
+// is awaited (requests with other pool indices are unaffected).
 void NpuInferRequest::wait() {
-    check_ze(zeCommandQueueSynchronize(queue_, UINT64_MAX), "QueueSynchronize");
+    check_ze(zeFenceHostSynchronize(fence_, UINT64_MAX), "FenceHostSynchronize");
+}
+
+bool NpuInferRequest::try_wait() {
+    ze_result_t result = zeFenceQueryStatus(fence_);
+    if (result == ZE_RESULT_SUCCESS) return true;
+    if (result == ZE_RESULT_NOT_READY) return false;
+    check_ze(result, "FenceQueryStatus");
+    return false;
 }
 
 // ============================================================================
@@ -121,20 +124,20 @@ void NpuInferRequest::wait() {
 NpuGraph::NpuGraph(
     ze_context_handle_t context,
     ze_device_handle_t device,
-    ze_command_queue_handle_t queue,
-    uint32_t queue_ordinal,
+    std::vector<QueueSlot>* queue_pool,
     const std::string& model_path,
     ze_graph_dditable_ext_t* graph_api,
     size_t num_requests
-) : context_(context), device_(device), queue_(queue), queue_ordinal_(queue_ordinal), graph_api_(graph_api)
+) : context_(context), device_(device), queue_pool_(queue_pool), graph_api_(graph_api)
 {
     init_graph(model_path);
     query_arguments();
 
-    // Create Ping-Pong InferRequest pool
+    // Create the infer-request pool (software pipeline depth; queue/fence are
+    // borrowed from the shared engine pool slot-by-slot)
     for (size_t i = 0; i < num_requests; ++i) {
         requests_.push_back(std::make_unique<NpuInferRequest>(
-            context_, device_, queue_, queue_ordinal_, graph_, inputs_, outputs_, graph_api_
+            context_, device_, &(*queue_pool_)[i], graph_, inputs_, outputs_, graph_api_
         ));
     }
 }
@@ -222,17 +225,18 @@ void NpuGraph::init_graph(const std::string& model_path) {
 
     check_ze(graph_api_->pfnCreate2(context_, device_, &desc, &graph_), "GraphCreate2");
 
-    // Initialize Graph on NPU (allocates hardware scratchpad & firmware structures)
+    // Initialize Graph on NPU (allocates hardware scratchpad & firmware
+    // structures). The pool's first queue is idle at load time and reused here.
     ze_command_list_desc_t init_cmd_desc{};
     init_cmd_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
-    init_cmd_desc.commandQueueGroupOrdinal = queue_ordinal_;
+    init_cmd_desc.commandQueueGroupOrdinal = queue_pool_->front().ordinal;
     ze_command_list_handle_t init_cmd_list = nullptr;
     check_ze(zeCommandListCreate(context_, device_, &init_cmd_desc, &init_cmd_list), "InitCommandListCreate");
 
     check_ze(graph_api_->pfnAppendGraphInitialize(init_cmd_list, graph_, nullptr, 0, nullptr), "AppendGraphInitialize");
     check_ze(zeCommandListClose(init_cmd_list), "InitCommandListClose");
-    check_ze(zeCommandQueueExecuteCommandLists(queue_, 1, &init_cmd_list, nullptr), "InitExecute");
-    check_ze(zeCommandQueueSynchronize(queue_, UINT64_MAX), "InitSynchronize");
+    check_ze(zeCommandQueueExecuteCommandLists(queue_pool_->front().queue, 1, &init_cmd_list, nullptr), "InitExecute");
+    check_ze(zeCommandQueueSynchronize(queue_pool_->front().queue, UINT64_MAX), "InitSynchronize");
     check_ze(zeCommandListDestroy(init_cmd_list), "InitCommandListDestroy");
 }
 
@@ -282,8 +286,28 @@ NpuEngine& NpuEngine::instance() {
 }
 
 NpuEngine::~NpuEngine() {
-    if (queue_) zeCommandQueueDestroy(queue_);
+    for (auto& slot : queue_pool_) if (slot.fence) zeFenceDestroy(slot.fence);
+    for (auto& slot : queue_pool_) if (slot.queue) zeCommandQueueDestroy(slot.queue);
     if (context_) zeContextDestroy(context_);
+}
+
+void NpuEngine::ensure_queue_pool(size_t count) {
+    while (queue_pool_.size() < count) {
+        QueueSlot slot;
+        slot.ordinal = queue_ordinal_;
+        ze_command_queue_desc_t queue_desc{};
+        queue_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
+        queue_desc.ordinal = queue_ordinal_;
+        queue_desc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
+        queue_desc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
+        check_ze(zeCommandQueueCreate(context_, device_, &queue_desc, &slot.queue), "CommandQueueCreate");
+
+        ze_fence_desc_t fence_desc{};
+        fence_desc.stype = ZE_STRUCTURE_TYPE_FENCE_DESC;
+        check_ze(zeFenceCreate(slot.queue, &fence_desc, &slot.fence), "FenceCreate");
+
+        queue_pool_.push_back(slot);
+    }
 }
 
 bool NpuEngine::initialize() {
@@ -371,17 +395,10 @@ bool NpuEngine::initialize() {
         }
     }
 
-    // Create Context & Command Queue
+    // Create Context (command queues belong to the per-request slots)
     ze_context_desc_t context_desc{};
     context_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
     check_ze(zeContextCreate(driver_, &context_desc, &context_), "zeContextCreate");
-
-    ze_command_queue_desc_t queue_desc{};
-    queue_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
-    queue_desc.ordinal = queue_ordinal_;
-    queue_desc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
-    queue_desc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
-    check_ze(zeCommandQueueCreate(context_, device_, &queue_desc, &queue_), "zeCommandQueueCreate");
 
     initialized_ = true;
     std::cout << "[+] Level Zero NPU Engine Initialized: " << device_name_ << "\n";
@@ -392,7 +409,8 @@ std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path, s
     if (!initialize()) {
         throw std::runtime_error("NpuEngine initialization failed.");
     }
-    return std::make_shared<NpuGraph>(context_, device_, queue_, queue_ordinal_, model_path, graph_api_, num_requests);
+    ensure_queue_pool(num_requests);
+    return std::make_shared<NpuGraph>(context_, device_, &queue_pool_, model_path, graph_api_, num_requests);
 }
 
 } // namespace ppocr

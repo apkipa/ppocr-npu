@@ -21,14 +21,23 @@ struct TensorDesc {
     bool is_input = true;
 };
 
-// Represents a single asynchronous inference request slot with its own command list, USM buffers, and sync event
+// Shared queue pool slot. Request index -> pool index; at most one in-flight
+// request per index (det slot i%2, rec slot b%depth, grid slice s%2), so one
+// slot serves all graphs and the pool stays tiny.
+struct QueueSlot {
+    ze_command_queue_handle_t queue = nullptr;
+    ze_fence_handle_t fence = nullptr;
+    uint32_t ordinal = 0;
+};
+
+// Represents a single asynchronous inference request slot. Owns its command
+// list and USM buffers; the command queue and fence come from the engine pool.
 class NpuInferRequest {
 public:
     NpuInferRequest(
         ze_context_handle_t context,
         ze_device_handle_t device,
-        ze_command_queue_handle_t queue,
-        uint32_t queue_ordinal,
+        QueueSlot* slot,
         ze_graph_handle_t graph,
         const std::vector<TensorDesc>& inputs,
         const std::vector<TensorDesc>& outputs,
@@ -47,6 +56,9 @@ public:
     // Waits for NPU execution to complete (blocking)
     void wait();
 
+    // Non-blocking completion check
+    bool try_wait();
+
 private:
     ze_context_handle_t context_;
     ze_device_handle_t device_;
@@ -61,6 +73,7 @@ private:
     std::vector<void*> output_ptrs_;
 
     ze_command_list_handle_t command_list_ = nullptr;
+    ze_fence_handle_t fence_ = nullptr;
 };
 
 // Manages a compiled model instance on NPU
@@ -69,11 +82,10 @@ public:
     NpuGraph(
         ze_context_handle_t context,
         ze_device_handle_t device,
-        ze_command_queue_handle_t queue,
-        uint32_t queue_ordinal,
+        std::vector<QueueSlot>* queue_pool,
         const std::string& model_path,
         ze_graph_dditable_ext_t* graph_api,
-        size_t num_requests = 2 // Ping-Pong double buffering
+        size_t num_requests = 2 // in-flight software pipeline depth per graph
     );
     ~NpuGraph();
 
@@ -90,8 +102,7 @@ private:
 
     ze_context_handle_t context_;
     ze_device_handle_t device_;
-    ze_command_queue_handle_t queue_;
-    uint32_t queue_ordinal_;
+    std::vector<QueueSlot>* queue_pool_ = nullptr;
     ze_graph_dditable_ext_t* graph_api_;
     ze_graph_handle_t graph_ = nullptr;
 
@@ -111,7 +122,6 @@ public:
 
     ze_context_handle_t context() const { return context_; }
     ze_device_handle_t device() const { return device_; }
-    ze_command_queue_handle_t queue() const { return queue_; }
     ze_graph_dditable_ext_t* graph_api() const { return graph_api_; }
 
     const std::string& device_name() const { return device_name_; }
@@ -120,12 +130,15 @@ private:
     NpuEngine() = default;
     ~NpuEngine();
 
+    // Grows the shared queue pool to at least `count` slots
+    void ensure_queue_pool(size_t count);
+
     bool initialized_ = false;
     ze_driver_handle_t driver_ = nullptr;
     ze_device_handle_t device_ = nullptr;
     ze_context_handle_t context_ = nullptr;
-    ze_command_queue_handle_t queue_ = nullptr;
     uint32_t queue_ordinal_ = 0;
+    std::vector<QueueSlot> queue_pool_;
     ze_graph_dditable_ext_t* graph_api_ = nullptr;
     std::string device_name_ = "Unknown NPU";
 };
