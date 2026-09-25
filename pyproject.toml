@@ -1,0 +1,23 @@
+[project]
+name = "ppocr-npu"
+version = "0.1.0"
+description = "High-performance PP-OCRv6 pipeline on Intel NPU (Level Zero / OpenVINO Native)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openvino>=2025.2.0",
+    "numpy>=1.26.0",
+    "opencv-python>=4.8.0",
+    "shapely>=2.0.0",
+    "pyyaml>=6.0",
+    "pyclipper>=1.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+]
