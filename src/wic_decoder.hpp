@@ -31,6 +31,10 @@ public:
     // Extracts a sub-rectangle tile with zero padding if out of bounds (for slicing)
     static ImageBGR extract_tile(const ImageBGR& src, int x, int y, int w, int h, uint8_t pad_val = 0);
 
+    // Resizes a BGR image with the same 8-bit fixed-point INTER_LINEAR path
+    // PaddleOCR uses (via OpenCV), matching the reference detector preprocessing.
+    static ImageBGR resize_linear(const ImageBGR& src, int dst_w, int dst_h);
+
     // Crops a quad (4 points) from source image and perspective/affine warps to dst_w x dst_h BGR
     // Supports physical aspect-ratio preservation with zero-padding
     static ImageBGR crop_quad(const ImageBGR& src, const std::vector<Point2f>& quad, int dst_w, int dst_h);

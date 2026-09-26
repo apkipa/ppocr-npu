@@ -24,6 +24,11 @@ public:
     ~ComScope() { CoUninitialize(); }
 };
 
+// CvRound: round half to even, matching OpenCV's coefficient rounding.
+short cv_round_to_short(double value) {
+    return static_cast<short>(std::nearbyint(value));
+}
+
 } // namespace
 
 bool WicDecoder::decode_file(const std::wstring& file_path, ImageBGR& out_image) {
@@ -180,6 +185,84 @@ ImageBGR WicDecoder::extract_tile(const ImageBGR& src, int x, int y, int w, int 
     }
 
     return tile;
+}
+
+ImageBGR WicDecoder::resize_linear(const ImageBGR& src, int dst_w, int dst_h) {
+    ImageBGR dst;
+    if (src.empty() || dst_w <= 0 || dst_h <= 0) return dst;
+
+    dst.width = dst_w;
+    dst.height = dst_h;
+    dst.channels = 3;
+    dst.data.resize(static_cast<size_t>(dst_w) * dst_h * 3);
+
+    const int scale = 1 << 11;
+
+    // Horizontal taps: same as PPOCRPreprocess.BuildLinearCoefficients
+    std::vector<int> x_offsets(dst_w);
+    std::vector<short> x_coeffs(static_cast<size_t>(dst_w) * 2);
+    for (int d = 0; d < dst_w; ++d) {
+        double coordinate = (static_cast<double>(d) + 0.5) * src.width / dst_w - 0.5;
+        int source = static_cast<int>(std::floor(coordinate));
+        double fraction = coordinate - source;
+        if (source < 0) { source = 0; fraction = 0.0; }
+        if (source >= src.width - 1) { source = src.width - 1; fraction = 0.0; }
+        x_offsets[d] = source;
+        x_coeffs[d * 2] = cv_round_to_short((1.0 - fraction) * scale);
+        x_coeffs[d * 2 + 1] = cv_round_to_short(fraction * scale);
+    }
+
+    // Vertical taps: edges keep the raw fraction (OpenCV clips source rows only)
+    std::vector<int> y_source(dst_h);
+    std::vector<short> y_coeffs(static_cast<size_t>(dst_h) * 2);
+    for (int d = 0; d < dst_h; ++d) {
+        double coordinate = (static_cast<double>(d) + 0.5) * src.height / dst_h - 0.5;
+        int source = static_cast<int>(std::floor(coordinate));
+        double fraction = coordinate - source;
+        y_source[d] = source;
+        y_coeffs[d * 2] = cv_round_to_short((1.0 - fraction) * scale);
+        y_coeffs[d * 2 + 1] = cv_round_to_short(fraction * scale);
+    }
+
+    std::vector<int> row0(static_cast<size_t>(dst_w) * 3);
+    std::vector<int> row1(static_cast<size_t>(dst_w) * 3);
+
+    for (int oy = 0; oy < dst_h; ++oy) {
+        int sy = y_source[oy];
+        int sy0 = std::clamp(sy, 0, src.height - 1);
+        int sy1 = std::clamp(sy + 1, 0, src.height - 1);
+        const uint8_t* row0_src = src.data.data() + static_cast<size_t>(sy0) * src.width * 3;
+        const uint8_t* row1_src = src.data.data() + static_cast<size_t>(sy1) * src.width * 3;
+
+        for (int ox = 0; ox < dst_w; ++ox) {
+            int sx = x_offsets[ox];
+            int sx1 = std::min(sx + 1, src.width - 1);
+            short c0 = x_coeffs[ox * 2];
+            short c1 = x_coeffs[ox * 2 + 1];
+            int so = sx * 3, so1 = sx1 * 3, doff = ox * 3;
+            for (int ch = 0; ch < 3; ++ch) {
+                row0[doff + ch] = row0_src[so + ch] * c0 + row0_src[so1 + ch] * c1;
+                row1[doff + ch] = row1_src[so + ch] * c0 + row1_src[so1 + ch] * c1;
+            }
+        }
+
+        short b0 = y_coeffs[oy * 2];
+        short b1 = y_coeffs[oy * 2 + 1];
+        uint8_t* dst_row = dst.data.data() + static_cast<size_t>(oy) * dst_w * 3;
+        for (int ox = 0; ox < dst_w; ++ox) {
+            int doff = ox * 3;
+            for (int ch = 0; ch < 3; ++ch) {
+                int h0 = row0[doff + ch];
+                int h1 = row1[doff + ch];
+                int value = (((h0 >> 4) * b0 >> 16) + ((h1 >> 4) * b1 >> 16) + 2) >> 2;
+                if (value < 0) value = 0;
+                else if (value > 255) value = 255;
+                dst_row[doff + ch] = static_cast<uint8_t>(value);
+            }
+        }
+    }
+
+    return dst;
 }
 
 ImageBGR WicDecoder::crop_quad_natural(const ImageBGR& src, const std::vector<Point2f>& quad, int target_h) {

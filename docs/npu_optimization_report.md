@@ -274,7 +274,7 @@ PP-OCRv6 Rec 存在固定的 $8\times$ 下采样，时间步长 $T = W / 8$。�
 ### 4. XML 形状"动态修改"的合法边界
 * OpenVINO IR（`<net version="11">`，PIR 序列化）**没有 XSD**，事实规范是 OV 前端实现；只需改 Parameter 层一处 `<data shape="1,3,48,W">`，下游 port 的缓存 dims 会被重新推导（已实测 320→416 生效，输出时间步 40→52 自动正确）；
 * 数值按十进制解析，**前导零合法**（`0320`→320、`0416`→416 均已编译并推理验证），因此模板可将宽度字段规范化为定长 4 位，形状切换退化为 4 字节内存 patch，零重建；
-* **模板 + bin 复用（已落地）**：`models/ppocrv6_small_rec_template.xml`（`1,3,48,0000`）与 `models/ppocrv6_small_det_template.xml`（`1,3,0000,0000`）为形状模板，权重 bin 一份通用（rec 三档 bin 实测 MD5 完全相同）；加载时 CLI 把 4 位补零字段等长覆盖为具体值（rec `0160/0320/0640`，det `0640`），模板与原始模型均不被改写；驱动按填充后容器哈希做编译缓存（首次 ~0.9s，复载 ~13ms）；
+* **模板 + bin 复用（已落地）**：`models/ppocrv6_small_rec_template.xml`（`1,3,48,0000`）与 `models/ppocrv6_small_det_template.xml`（`1,3,0000,0000`）为形状模板，权重 bin 一份通用（rec 三档 bin 实测 MD5 完全相同）；加载时 CLI 把 4 位补零字段等长覆盖为具体值（rec `0160/0320/0640`，det `0640`/`0960`），模板与原始模型均不被改写；驱动按填充后容器哈希做编译缓存（首次 ~0.9s，复载 ~13ms）；
 * 限制：维度必须是静态值（无上界动态维度被 VPUX 编译器的 `PopulateDynamicDimensionsHW` 拒绝；有界动态亦不可用）——"动态桶"= 每种宽度各一份静态图，由驱动缓存摊薄编译成本。
 
 ### 5. 单文件发布形态（`.ngraph_lite` 直载）与容器格式修正
@@ -290,3 +290,65 @@ PP-OCRv6 Rec 存在固定的 $8\times$ 下采样，时间步长 $T = W / 8$。�
 * **热启动**：只读 `CreateFileMapping/MapViewOfFile` 映射 blob → `pfnCreate2(NATIVE)` → 驱动在 `initialize_graph()` 期间把 blob 拷走 → 返回即 `UnmapViewOfFile`；热路径**不读 xml/bin**（仅 stat + 映射 + 建图）；
 * **为何不用 `ZE_GRAPH_FLAG_INPUT_GRAPH_PERSISTENT`（零拷贝）**：页对齐 `inputSize` 后该路径可用（未页对齐时驱动返回 `0x7800000A ZE_RESULT_ERROR_UNSUPPORTED_ALIGNMENT`），但实测零拷贝把整份 blob（4 图 ~54MB）钉在进程工作集，启动/私有内存/设备 DDR 均无收益；`zeMemAllocHost` 外部内存导入更贵（+87ms），已弃用；
 * **实测（4 图 blank 热启动，12 轮配对）**：默认 mmap ≈ 179.7ms（比原生预编译 blob 快 ~20ms、比驱动缓存模式快 ~55ms）；PeakPrivate 58MB（原生 vector 71.8MB、驱动缓存 74.8MB）；PeakWS 160MB；NPU DDR 120,868 KB（四种加载方式逐图完全相同，设备侧与主机加载方式无关）；
+
+### 7. `--det-960`：C#/PaddleOCR 风格的整图缩放检测
+* **背景**：默认 det 走 640 平铺（1:1，热力图与原图同尺寸）；`--det-960` 改为官方/C# 的单图缩放路径；
+* **预处理**：`ComputeDetSize(w,h,960)`（只缩不放、`floor(x/32+0.5)*32`、最小 32）→ `WicDecoder::resize_linear`（移植 C#/OpenCV 8 位定点 INTER_LINEAR：11 位系数、水平端点清零小数、垂直端点保留小数、round-half-to-even）→ 贴进 960×960 左上、右下补零 → NCHW fp16；
+* **模型/缓存**：det 默认 base 改为 `models/ppocrv6_small_det_template`，模板按 fill 派生缓存名；`--det-960` 只把 fill 从 `1x3x640x640` 换成 `1x3x960x960`，缓存 `cache/lite/ppocrv6_small_det_template_1x3x960x960.blob`（首次冷编译 ~2.2s、38.9MB）；输入尺寸不匹配时直接报错；
+* **后处理**：960×960 热力图裁回目标尺寸再交给 DBNet 后处理，现有 `scale=orig/target` 自动生效，无需改后处理；
+* **与默认 640 平铺对比**（阶段合计不含模型加载/引擎初始化）：
+  * **01c.jpg（2560×1524，短行）**：默认 15 tile → 147 行，det 289.7ms / stitch 16.3ms / 合计 ~695.5ms；`--det-960` → 960×576，137 行，det 90.2ms / stitch 2.4ms / 合计 ~471.6ms（960 明显更快）；
+  * **01.png（2560×1528，长行密集）**：默认 15 tile → 64 行（**过分割**），det 351.0ms / rec 393.7ms / 合计 ~854.2ms；`--det-960` → 960×576，41 行，det 157.1ms / rec 545.1ms / 合计 ~794.3ms（det 省 194ms，但长行合并使 rec 涨 151ms，净省 ~60ms；日志 Total 含模型加载，960 图 38.9MB/159MB DDR 反而略高，不能当流水线指标）；
+* **与 C#（Sdcb.SimdPaddleOCR sharp, small, AVX2）对比**（同机、同图；C# 无模型加载计时）：
+  * **01c.jpg**：1-worker 全流程 ~1216.8ms（det_graph 56.1、rec_graph 970.6、cls_graph 130.4），4-worker ~481.8ms；本引擎 `--det-960` 合计 ~471.6ms（det 90.2、rec 306.6），约与 C# 4-worker 持平：det 慢于 CPU AVX2，rec 约快 3.2×；
+  * **01.png**：1-worker ~1188.0ms（det_graph 62.7、rec_graph 1034.5、cls_graph 33.9），4-worker ~586.8ms；本引擎 `--det-960` 合计 ~794.3ms（det 157.1、rec 545.1），比 C# 1-worker 快约 1.5×、比 4-worker 慢约 1.35×；C# 同样检出 **41 行**，与本引擎 `--det-960` 一致（默认平铺 64 行属过分割）——即 960 路径的检测粒度与官方/C# 对齐；
+  * **口径**：C# 含 CLS（01c ~130ms / 01.png ~38ms）且 4-worker 用多核并行；本引擎为单 NPU 设备、无 CLS，非严格 apples-to-apples；
+
+### 8. NPU 冷启动惩罚定位：DVFS 省电提示（`--det-960` 的首发异常值根因）
+* **现象**：每次新进程第一次 det 明显偏慢且抖动（960 单图首跑 92–157ms），连跑后稳定在 ~31ms；曾据此误判"960 每像素慢 3.5×"，实为拿冷值比热值；
+* **同进程探针**（`Z:\TEMP\det-probe`，用引擎 + 独立 standalone 两版；960 det 单图）：
+  * 进程内连发：`82.4 → 47.4 → 40.5 → 35.7 → 32.7 → 33.3 → 32.1 → 32.0`；连发 20 次稳态 **中位 31.5ms（30.8–33.2）**；
+  * 空闲 5s / 30s 后首发：**60.5 / 71.3ms**，随后 `53 → 41 → 35` 阶梯回到稳态；6 次重复完全一致；
+  * 该阶梯是**固定 3 级**（71→53→41→35），符合时钟分档爬升（DVFS P-state stepping），不是内存回收（后者不会分级、且 5s 就触发）；
+* **排除项**：
+  * `ZE_NPU_CONTEXT_OPTION_IDLE_OPTIMIZATIONS` 关闭（`zeContextSetProperties(options=0)`）→ 首发 71.4ms，**无变化**（排除空闲内存驱逐）；
+  * 扩展列表确认 Windows 驱动暴露 18 个扩展，含 `ZE_extension_context_npu` / `command_queue_npu` / `profiling_data` / `ZE_experimental_power_saving_hint`；
+* **决定性对照**（standalone，空闲 30s 后首发，6 次中位）：
+
+  | 配置 | 首发 | 第 2 发 | 稳态 |
+  |---|---:|---:|---:|
+  | 默认（不传 hint） | 71.3 | 53 | 31 |
+  | `context_npu` 关空闲优化 | 71.4 | 53 | 31 |
+  | **`power_saving_hint=0`（禁省电）** | **44.0**（复现 43.5） | **31** | 31 |
+  | `power_saving_hint=100`（最大省电） | 72.8 | 53 | 31 |
+
+* **结论**：冷启动惩罚 = **NPU DVFS 省电管理**；驱动默认即最大省电。上下文创建时挂 `ze_context_power_saving_hint_exp_desc_t{ hint = ZE_POWER_SAVING_HINT_TYPE_MIN(0) }` 可把首发 71→44ms（-38%）且第 2 发即回稳态，**稳态吞吐无代价**；代价是 NPU 空闲时不再省电；
+* **跨图预热**：`idle30 → det` 71.7ms；`idle30 → rec160×3 → det` 59.8ms（rec160 冷首发 15.0ms）——台阶部分是设备全局、部分是每图自预热；
+* **测量注意**：单次运行的首发值不可引用；比较必须用同进程稳态（中位），或明确标注"冷/热"；`coreClockRate` 读数为 `1600000000`（驱动未做单位缩放，应理解为 1600MHz）。
+* **频率直接实测**（图剖析扩展 `ZE_extension_profiling_data`，`PERF_COUNT=YES` 重编译，取每任务 `active_cycles`/`duration_ns` 求和，`freq = cycles/duration`）：
+  * **同一工作量 `active_cycles` 恒为 31,235,782**，只有 duration 变化 → 纯频率变化，非计算量差异；
+  * 进程内连发 8 次：**186.7 → 217.2 → 269.4 → 309.0 → 331.5 → 343.8 → 339.9 → 331.2 MHz**；
+  * 30s 空闲后 6 次：**183.8 → 184.4 → 188.4 → 193.4 → 209.9 → 231.9 MHz**（掉回低频再爬升）；
+  * 再 30s 空闲后 4 次：**184.5 → 184.2 → 181.4 → 202.4 MHz**（可重复）；
+  * 结论：暖态约 **344MHz**、空闲后约 **184MHz**，**1.87× 频率差**，与墙钟冷/热比（~71/35≈2.0）一致——DVFS 由推断变为实测；
+* **剖析读取陷阱**：剖析池 BO 为 `CachedDma`（`graph.cpp:418`），驱动读取路径不做 cache 失效，**同一 query 槽重复读会返回首次的陈旧值**（曾出现 9 次读数一字不差）；必须**每发换新槽、每槽只读一次**才能拿到该次执行的真实值。
+* **取证脚本**：`Z:\TEMP\det-probe`（`standalone.cpp` = 上下文参数 A/B；`prof.cpp` = 频率实测 + turbo 队列 A/B；均为独立探针，不依赖引擎、不改仓库）。
+
+### 9. `--turbo`：低延迟命令队列（可选，默认关）
+* **它具体做什么**（源码路径）：
+  * **UMD**：`ze_command_queue_desc_npu_ext_t{ turbo = true }` 经 `desc->pNext` → `ModeFlags::TURBO`（`cmdqueue.cpp:110-115`）→ ioctl 置 `DRM_IVPU_CMDQ_FLAG_TURBO`（`vpu_driver_api.cpp:139-154`）；每次提交时 `cmdBuf->useBusyWait()`（`vpu_command_queue.cpp:176-177`）在命令缓冲尾部加自信号 fence、置 `HOST_RESET`，等待时先 `UMONITOR/UMWAIT` 自旋（≤15ms，`command_buffer.cpp:315-345`）再回落 ioctl 等待；
+  * **内核**（uapi 契约，源码不在此仓库）：`DRM_IVPU_CMDQ_FLAG_TURBO` — *"Enable low-latency mode… The NPU will maximize performance when executing jobs from such queue at the cost of increased power usage"*（`ivpu_accel.h:557-560`）；
+  * **固件**：`VPU_JOB_QUEUE_FLAGS_TURBO_MODE` — *"Enable turbo mode for testing NPU performance; not recommended for regular usage"*（`vpu_jsm_api.h:145-147`）；
+  * 与 `ZE_NPU_COMMAND_QUEUE_OPTION_DEVICE_SYNC` 互斥（同时给会静默不启 turbo，`cmdqueue.cpp:129-134`）。
+* **作用域**：per-queue。`--turbo` 开启时队列池（det + rec 共用）整体带 turbo；`zeCommandQueueSynchronize`（建图初始化）也走 busy-wait。
+* **开关**：`--turbo`，默认关；`NpuEngine::set_turbo()` 需在 `load_model()` 之前调用；运行时检查 `ZE_extension_command_queue_npu` 是否存在、创建失败时回退普通队列并告警。
+* **实测（空闲 3s 后冷启动，探针每发换槽读一次真实频率）**：
+
+  | 场景 | 首发墙钟 | 首发频率 | 稳态 |
+  |---|---:|---:|---:|
+  | 普通队列 | 58.4 / 62.1 ms | 213 / 185 MHz | ~34 ms / 242 MHz（仍在爬） |
+  | **turbo 队列** | **36.2 / 33.2 ms** | **349 / 358 MHz** | **33.8 / 34.2 ms / ~355 MHz** |
+
+  * 引擎实测（01.png）：平铺 det **296.5/288.3/297.4 → 233.0/231.6/230.6 ms**；`--det-960` det **92.4/92.8/96.1 → 64.3/65.6/65.3 ms**、rec 374–379 → 345–348 ms、Total 905–919 → 847–863 ms；输出 41 条与默认完全一致；
+  * 注意：引擎首图仍有 ~64ms（探针稳态 ~35ms），剩余部分是"每进程首次执行"成本，turbo 只解决 DVFS 部分；
+  * 代价：功耗上升（内核/固件注释见上）。

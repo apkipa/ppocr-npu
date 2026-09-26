@@ -143,6 +143,13 @@ public:
     // keeps compiled blobs in the project's own cache/lite/ directory instead.
     void set_manual_blob_cache(bool enabled) { manual_blob_cache_ = enabled; }
 
+    // Opt-in low-latency command queues (ZE_extension_command_queue_npu): the
+    // kernel/firmware maximize NPU performance for jobs on these queues (no
+    // DVFS downclocking after idle) and the UMD busy-waits on completion.
+    // Costs power; firmware marks it "not recommended for regular usage".
+    // Must be set before the queue pool is created (i.e. before load_model()).
+    void set_turbo(bool enabled) { turbo_ = enabled; }
+
     // Prints per-context NPU memory usage (DDR / driver cache / program cache).
     void print_memory_usage(const char* tag = "");
 
@@ -172,6 +179,9 @@ private:
     ze_graph_dditable_ext_t* graph_api_ = nullptr;
     bool use_lite_ = false;
     bool manual_blob_cache_ = false;
+    bool turbo_ = false;
+    bool turbo_supported_ = false;
+    bool turbo_warned_ = false;
     std::string device_name_ = "Unknown NPU";
 };
 

@@ -27,7 +27,8 @@ void print_usage(const char* prog) {
     std::cout << "Options:\n";
     std::cout << "  --image <path>         Path to input image file (JPG, PNG, BMP, TIFF, WebP)\n";
     std::cout << "  --clipboard            Read image directly from Windows Clipboard\n";
-    std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_640x640.xml]\n";
+    std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_template.xml]\n";
+    std::cout << "  --det-960              Downscale long side to <=960 (round to 32) and run a single 960x960 det bucket\n";
     std::cout << "  --rec-160 <path>       Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w160.xml]\n";
     std::cout << "  --rec-320 <path>       Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w320.xml]\n";
     std::cout << "  --rec-640 <path>       Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w640.xml]\n";
@@ -37,6 +38,7 @@ void print_usage(const char* prog) {
     std::cout << "  --rec-depth <n>        Number of in-flight rec requests per graph (default 2)\n";
     std::cout << "  --native               Use the local NATIVE blob cache (cache/*.blob) instead of NGRAPH_LITE\n";
     std::cout << "  --driver-cache         Use the driver disk cache instead of the cache/lite/ blob cache\n";
+    std::cout << "  --turbo                Low-latency command queues (max NPU clocks, no idle downclock; higher power)\n";
     std::cout << "  --profile, -p          Print detailed end-to-end performance breakdown\n";
     std::cout << "  --help, -h             Show this help message\n";
 }
@@ -68,7 +70,7 @@ int main(int argc, char* argv[]) {
             return base_no_ext + ".xml";
         };
 
-        std::string det_model = resolve_model("models/ppocrv6_small_det_640x640");
+        std::string det_model = resolve_model("models/ppocrv6_small_det_template");
         std::string rec_160 = resolve_model("models/ppocrv6_small_rec_w160");
         std::string rec_320 = resolve_model("models/ppocrv6_small_rec_w320");
         std::string rec_640 = resolve_model("models/ppocrv6_small_rec_w640");
@@ -77,6 +79,8 @@ int main(int argc, char* argv[]) {
         bool rec_poll = false;
         bool use_lite = true;
         bool blob_cache = true;
+        bool det_960 = false;
+        bool turbo = false;
         int rec_depth = 2;
         ppocr::ProfileMetrics metrics;
 
@@ -108,6 +112,10 @@ int main(int argc, char* argv[]) {
                 use_lite = false;
             } else if (arg == "--driver-cache") {
                 blob_cache = false;
+            } else if (arg == "--det-960") {
+                det_960 = true;
+            } else if (arg == "--turbo") {
+                turbo = true;
             } else if (arg == "--profile" || arg == "-p") {
                 metrics.enabled = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -165,16 +173,18 @@ int main(int argc, char* argv[]) {
         }
         engine.set_ngraph_lite(use_lite);
         engine.set_manual_blob_cache(blob_cache);
+        engine.set_turbo(turbo);
         if (metrics.enabled) engine.print_memory_usage("[baseline]");
 
         // 3. Load Models
-        constexpr std::array<int64_t, 4> kDetFill{1, 3, 640, 640};
+        constexpr std::array<int64_t, 4> kDet640Fill{1, 3, 640, 640};
+        constexpr std::array<int64_t, 4> kDet960Fill{1, 3, 960, 960};
         constexpr std::array<int64_t, 4> kRec160Fill{1, 3, 48, 160};
         constexpr std::array<int64_t, 4> kRec320Fill{1, 3, 48, 320};
         constexpr std::array<int64_t, 4> kRec640Fill{1, 3, 48, 640};
 
         std::cout << "[*] Loading Detection model onto NPU: " << det_model << "..." << std::endl;
-        auto det_graph = engine.load_model(det_model, 2, kDetFill); // 2-deep tile pipeline (submit-ahead)
+        auto det_graph = engine.load_model(det_model, 2, det_960 ? kDet960Fill : kDet640Fill); // 2-deep tile pipeline (submit-ahead)
         if (metrics.enabled) engine.print_memory_usage("[after det]");
 
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
@@ -192,7 +202,63 @@ int main(int argc, char* argv[]) {
         bool need_slice = force_slice || (src_image.width > tile_size || src_image.height > tile_size);
         ppocr::ProbHeatmap heatmap(src_image.width, src_image.height);
 
-        if (need_slice) {
+        if (det_960) {
+            if (det_graph->inputs().empty() ||
+                det_graph->inputs()[0].total_bytes != static_cast<size_t>(960) * 960 * 3 * 2) {
+                throw std::runtime_error("--det-960 requires a 960x960 det graph (use the shape template)");
+            }
+
+            int tw = src_image.width;
+            int th = src_image.height;
+            {
+                const int limit = 960;
+                int max_side = std::max(tw, th);
+                double ratio = (max_side > limit) ? static_cast<double>(limit) / max_side : 1.0;
+                auto round32 = [](int v) {
+                    return std::max(32, static_cast<int>(std::floor(v / 32.0 + 0.5)) * 32);
+                };
+                tw = round32(static_cast<int>(src_image.width * ratio));
+                th = round32(static_cast<int>(src_image.height * ratio));
+            }
+
+            ppocr::ImageBGR resized = ppocr::WicDecoder::resize_linear(src_image, tw, th);
+
+            ppocr::ImageBGR bucket;
+            bucket.width = 960;
+            bucket.height = 960;
+            bucket.channels = 3;
+            bucket.data.assign(static_cast<size_t>(960) * 960 * 3, 0);
+            for (int y = 0; y < th; ++y) {
+                std::memcpy(bucket.data.data() + static_cast<size_t>(y) * 960 * 3,
+                            resized.data.data() + static_cast<size_t>(y) * tw * 3,
+                            static_cast<size_t>(tw) * 3);
+            }
+
+            metrics.det_tile_count = 1;
+            auto& req = det_graph->get_request(0);
+            ppocr::WicDecoder::normalize_to_nchw_fp16(bucket, req.get_input_ptr(0));
+            {
+                ppocr::ScopedTimer timer(metrics.det_inference_ms);
+                req.start_async();
+                req.wait();
+            }
+
+            const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+            ppocr::ProbHeatmap full(960, 960);
+            for (int p = 0; p < 960 * 960; ++p) {
+                full.data()[p] = ppocr::fp16_to_float(p_out_fp16[p]);
+            }
+
+            heatmap = ppocr::ProbHeatmap(tw, th);
+            for (int y = 0; y < th; ++y) {
+                std::memcpy(heatmap.data().data() + static_cast<size_t>(y) * tw,
+                            full.data().data() + static_cast<size_t>(y) * 960,
+                            static_cast<size_t>(tw) * sizeof(float));
+            }
+
+            std::cout << "[*] --det-960: " << src_image.width << "x" << src_image.height
+                      << " -> " << tw << "x" << th << " (padded to 960x960)\n";
+        } else if (need_slice) {
             // Uniformly distributed tiling with guaranteed min_overlap=80
             const int min_overlap = 80;
             const int eff_step = tile_size - min_overlap;

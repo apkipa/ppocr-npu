@@ -1,5 +1,7 @@
 #include "npu_engine.hpp"
 
+#include <ze_command_queue_npu_ext.h>
+
 #include <windows.h>
 
 #include <chrono>
@@ -780,12 +782,30 @@ void NpuEngine::ensure_queue_pool(size_t count) {
     while (queue_pool_.size() < count) {
         QueueSlot slot;
         slot.ordinal = queue_ordinal_;
+        ze_command_queue_desc_npu_ext_t turbo_ext{};
+        turbo_ext.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC_NPU_EXT;
+        turbo_ext.turbo = true;
         ze_command_queue_desc_t queue_desc{};
         queue_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC;
         queue_desc.ordinal = queue_ordinal_;
         queue_desc.mode = ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS;
         queue_desc.priority = ZE_COMMAND_QUEUE_PRIORITY_NORMAL;
-        check_ze(zeCommandQueueCreate(context_, device_, &queue_desc, &slot.queue), "CommandQueueCreate");
+        if (turbo_ && turbo_supported_) {
+            queue_desc.pNext = &turbo_ext;
+        } else if (turbo_ && !turbo_warned_) {
+            std::cerr << "[-] --turbo: ZE_extension_command_queue_npu is not exposed by the driver; "
+                         "using normal queues.\n";
+            turbo_warned_ = true;
+        }
+        ze_result_t queue_ret = zeCommandQueueCreate(context_, device_, &queue_desc, &slot.queue);
+        if (queue_ret != ZE_RESULT_SUCCESS && queue_desc.pNext != nullptr) {
+            std::cerr << "[-] --turbo: turbo queue create failed (0x" << std::hex << queue_ret
+                      << std::dec << "); using a normal queue.\n";
+            turbo_warned_ = true;
+            queue_desc.pNext = nullptr;
+            queue_ret = zeCommandQueueCreate(context_, device_, &queue_desc, &slot.queue);
+        }
+        check_ze(queue_ret, "CommandQueueCreate");
 
         ze_fence_desc_t fence_desc{};
         fence_desc.stype = ZE_STRUCTURE_TYPE_FENCE_DESC;
@@ -852,6 +872,13 @@ bool NpuEngine::initialize() {
     for (const auto& ep : ext_props) {
         if (std::string(ep.name).find(ZE_GRAPH_EXT_NAME) == 0) {
             target_ext = &ep;
+            break;
+        }
+    }
+
+    for (const auto& ep : ext_props) {
+        if (std::string(ep.name) == ZE_COMMAND_QUEUE_NPU_EXT_NAME) {
+            turbo_supported_ = true;
             break;
         }
     }
