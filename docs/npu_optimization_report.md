@@ -248,3 +248,37 @@ PP-OCRv6 Rec 存在固定的 $8\times$ 下采样，时间步长 $T = W / 8$。�
    核显执行双线性插值（Bilinear）由独立的纹理采样电路（TMU）完成，计算开销为 0；在轻量场景下，直接调用 CPU AVX2 优化的 WIC 缩放器（`IWICBitmapScaler`）仅需数微秒，避免惊动 GPU 驱动。
 4. **DMA 与后处理的分工铁律**：
    NPU 硬件专攻稠密浮点乘加（15.8ms 产出热力图）；CPU 桌面大核专攻复杂分支与多边形几何拓扑（仅 3.4ms 完成轮廓提取）。两者流水线重叠，实现全系统 60 FPS 满血运行。
+
+---
+
+## 十一、 NGRAPH_LITE 直载通路与驱动级编译缓存（实测记录）
+
+### 1. 两条加载通路的本质区别
+* `ZE_GRAPH_FORMAT_NATIVE`（现状）：喂**已编译的 ELF/平铺二进制**（`.blob`），`pfnCreate2` 0.2ms 秒开，但 blob 与形状、编译器版本强绑定，换形状必须重新离线编译；
+* `ZE_GRAPH_FORMAT_NGRAPH_LITE`：直接喂 **XML+BIN 的轻量容器**，由**驱动内置 UMD 编译器 JIT 编译**（`graph.cpp: getBlobContainerNGraphLite → Compiler::getCompiledBlob`），运行时**零 Python、零 OpenVINO 离线步骤**。
+
+### 2. NGRAPH_LITE 容器字节布局（驱动测试构造法，实测可用）
+```text
+[ze_graph_compiler_version_info_t: u16 major, u16 minor]   ← 必须取自 pfnDeviceGetGraphProperties
+[u32 numInputs]
+[u64 sizeXml][xml bytes]
+[u64 sizeBin][bin bytes]
+```
+（注：`build_models.py` 早先的打包布局缺少 numInputs 且 sizeBin/sizeXml 错位，属历史遗留，本阶段不用它。）
+
+### 3. 驱动磁盘缓存（"编译一次、处处复用"）
+* **Windows**：`%LOCALAPPDATA%\Intel\NPU\<adapter-hash>\`。本机实测 582 个条目约 2.06 GB：8KB 元数据 + 9–70MB 编译产物，文件名为 `hash(desc + 编译器版本)`；命中时 `pfnGetProperties3` 返回 `ZE_GRAPH_PROPERTIES_FLAG_LOADED_FROM_CACHE`；
+* **Linux 源码对照**（`disk_cache.cpp`）：`$HOME/.cache/ze_intel_npu_cache`，上限由 `ZE_INTEL_NPU_CACHE_SIZE` 控制（默认 4GB，置 0 禁用）；
+* `pfnGetNativeBinary2` 可将驱动编译成果导出为 NATIVE blob（自建缓存备用，当前阶段不启用）。
+
+### 4. XML 形状"动态修改"的合法边界
+* OpenVINO IR（`<net version="11">`，PIR 序列化）**没有 XSD**，事实规范是 OV 前端实现；只需改 Parameter 层一处 `<data shape="1,3,48,W">`，下游 port 的缓存 dims 会被重新推导（已实测 320→416 生效，输出时间步 40→52 自动正确）；
+* 数值按十进制解析，**前导零合法**（`0320`→320、`0416`→416 均已编译并推理验证），因此模板可将宽度字段规范化为定长 4 位，形状切换退化为 4 字节内存 patch，零重建；
+* **模板 + bin 复用（已落地）**：`models/ppocrv6_small_rec_template.xml`（`1,3,48,0000`）与 `models/ppocrv6_small_det_template.xml`（`1,3,0000,0000`）为形状模板，权重 bin 一份通用（rec 三档 bin 实测 MD5 完全相同）；加载时 CLI 把 4 位补零字段等长覆盖为具体值（rec `0160/0320/0640`，det `0640`），模板与原始模型均不被改写；驱动按填充后容器哈希做编译缓存（首次 ~0.9s，复载 ~13ms）；
+* 限制：维度必须是静态值（无上界动态维度被 VPUX 编译器的 `PopulateDynamicDimensionsHW` 拒绝；有界动态亦不可用）——"动态桶"= 每种宽度各一份静态图，由驱动缓存摊薄编译成本。
+
+### 5. 单文件发布形态（`.ngraph_lite` 直载）与容器格式修正
+* **容器真格式**（编译器解析处 `vpux_compiler/frontend/xml_deserializer.cpp:76-128`，构造参照其 smoke 测试）：`[u16 major][u16 minor][u32 numElements][u64 xmlSize][xml][u64 weightsSize][weights]`；旧 `build_models.py` 的打包头字段错位（缺 weightsSize），已修正；
+* **发布形态**：只带 `models/*.ngraph_lite`（单文件，含 slim 模板或静态图 + 权重），**不带 xml/bin**；xml/bin 仅作开发期可读源与手工改形状用；
+* **CLI 就地 patch**：加载 `.ngraph_lite` 时覆写 4 字节编译器版本（来自 `pfnDeviceGetGraphProperties`，满足 `xml_deserializer.cpp:78` 的强校验），模板再等长覆盖形状占位（`0000`→`0160` 等），权重段原样复用；随后 `pfnCreate2(NGRAPH_LITE)`；
+* **脚本自动生成**：`build_models.py` 修正 packer 后自动产出静态/模板两类 `.ngraph_lite`（`--no-templates` 可跳过模板）；模板删除**全部** `<dim>`（含 Parameter 端口缓存，已知算子的 port dims 均惰性，源码依据 `xml_deserialize_util.cpp:1160-1310`），唯一占位与填充点都是 `data` 的 `shape` 属性；

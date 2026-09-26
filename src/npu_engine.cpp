@@ -1,8 +1,11 @@
 #include "npu_engine.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <cstring>
@@ -19,6 +22,102 @@ void check_ze(ze_result_t result, const char* msg) {
         ss << msg << " failed with Level Zero error: 0x" << std::hex << result;
         throw std::runtime_error(ss.str());
     }
+}
+
+// Shape templates carry fixed 4-digit zero-padded placeholders ("0000") as
+// fields of the input Parameter layer's data shape attribute, so concrete dims
+// can be written with an equal-length overwrite (leading zeros are valid IR
+// numbers). Port <dim> caches are not emitted by the template generator.
+bool is_shape_template(const std::string& xml) {
+    size_t p = xml.find("type=\"Parameter\"");
+    if (p == std::string::npos) return false;
+    size_t e = xml.find("</layer>", p);
+    if (e == std::string::npos) return false;
+    size_t sp = xml.find("shape=\"", p);
+    if (sp == std::string::npos || sp >= e) return false;
+    size_t sv = sp + 7;
+    size_t se = xml.find('"', sv);
+    if (se == std::string::npos || se > e) return false;
+
+    const std::string shape = xml.substr(sv, se - sv);
+    size_t pos = 0;
+    while (pos <= shape.size()) {
+        size_t comma = shape.find(',', pos);
+        const std::string dim =
+            shape.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (dim == "0000") return true;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return false;
+}
+
+// Fills the placeholder dims (by position: index 2 -> H, 3 -> W) with concrete
+// values, formatted as 4 digits, in the Parameter data shape attribute. Only
+// the Parameter layer is touched; bin is reused.
+std::string fill_template_shape(std::string xml, std::span<const int64_t> fill, bool& filled) {
+    filled = false;
+    const std::string ph = "0000";
+    size_t p = xml.find("type=\"Parameter\"");
+    if (p == std::string::npos) return xml;
+    size_t e = xml.find("</layer>", p);
+    if (e == std::string::npos) return xml;
+
+    std::string block = xml.substr(p, e - p);
+    if (block.find(ph) == std::string::npos) return xml;
+    if (fill.size() < 4) {
+        throw std::runtime_error("Shape template requires concrete fill dims (1,3,H,W)");
+    }
+
+    auto pad4 = [](int64_t v) -> std::string {
+        if (v < 0 || v > 9999) {
+            throw std::runtime_error("Shape template dim must fit 4 digits");
+        }
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%04d", static_cast<int>(v));
+        return buf;
+    };
+
+    // data shape attribute
+    size_t sp = block.find("shape=\"");
+    if (sp == std::string::npos) throw std::runtime_error("Template Parameter has no shape attribute");
+    size_t sv = sp + 7;
+    size_t se = block.find('"', sv);
+    if (se == std::string::npos) throw std::runtime_error("Malformed template Parameter shape");
+
+    std::string shape = block.substr(sv, se - sv);
+    std::vector<std::string> dims;
+    size_t pos = 0;
+    while (pos <= shape.size()) {
+        size_t comma = shape.find(',', pos);
+        dims.push_back(shape.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    for (size_t i = 0; i < dims.size(); ++i) {
+        if (dims[i] == ph && i < fill.size()) dims[i] = pad4(fill[i]);
+    }
+    std::string joined;
+    for (size_t i = 0; i < dims.size(); ++i) {
+        if (i) joined += ',';
+        joined += dims[i];
+    }
+    block = block.substr(0, sv) + joined + block.substr(se);
+
+    if (block.find(ph) != std::string::npos) {
+        throw std::runtime_error("Shape template placeholder unresolved (check template fields)");
+    }
+    filled = true;
+    return xml.substr(0, p) + block + xml.substr(e);
+}
+
+std::vector<uint8_t> read_file_bytes(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) throw std::runtime_error("Failed to open: " + path.string());
+    std::vector<uint8_t> data(static_cast<size_t>(f.tellg()));
+    f.seekg(0, std::ios::beg);
+    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return data;
 }
 
 } // namespace
@@ -127,8 +226,11 @@ NpuGraph::NpuGraph(
     std::vector<QueueSlot>* queue_pool,
     const std::string& model_path,
     ze_graph_dditable_ext_t* graph_api,
-    size_t num_requests
-) : context_(context), device_(device), queue_pool_(queue_pool), graph_api_(graph_api)
+    size_t num_requests,
+    bool use_lite,
+    std::span<const int64_t> fill_shape
+) : context_(context), device_(device), queue_pool_(queue_pool), graph_api_(graph_api),
+    use_lite_(use_lite), fill_shape_(fill_shape.begin(), fill_shape.end())
 {
     init_graph(model_path);
     query_arguments();
@@ -162,6 +264,91 @@ void NpuGraph::init_graph(const std::string& model_path) {
 
         if (!fs::exists(p) || !fs::exists(bin_path)) {
             throw std::runtime_error("XML or companion BIN not found: " + p.string());
+        }
+
+        std::string xml_text;
+        {
+            std::ifstream in(p, std::ios::binary);
+            if (!in.is_open()) throw std::runtime_error("Failed to open: " + p.string());
+            xml_text.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        }
+
+        // Shape templates carry fixed-width "0000" dims; they always go through
+        // the driver JIT path with concrete dims filled in memory (bin reused).
+        const bool shape_template = is_shape_template(xml_text);
+        if (shape_template) {
+            std::cout << "  [*] Shape template detected (driver JIT load): " << p.filename().string() << "\n";
+        }
+
+        if (use_lite_ || shape_template) {
+            // NGRAPH_LITE path: pack xml+bin into the driver container and let
+            // the driver's UMD compiler JIT it (no OpenVINO/Python involved).
+            // The driver's on-disk cache makes repeat loads fast.
+            bool filled = false;
+            xml_text = fill_template_shape(std::move(xml_text), fill_shape_, filled);
+            if (filled) {
+                std::cout << "  [+] Template filled to " << fill_shape_[2] << "x" << fill_shape_[3]
+                          << ": " << p.filename().string() << "\n";
+            }
+            if (is_shape_template(xml_text)) {
+                throw std::runtime_error("Shape template placeholders unresolved: " + p.string());
+            }
+
+            std::vector<uint8_t> bin = read_file_bytes(bin_path);
+            const std::vector<uint8_t> xml(xml_text.begin(), xml_text.end());
+
+            ze_device_graph_properties_t dev_props{};
+            dev_props.stype = ZE_STRUCTURE_TYPE_DEVICE_GRAPH_PROPERTIES;
+            check_ze(graph_api_->pfnDeviceGetGraphProperties(device_, &dev_props), "DeviceGetGraphProperties");
+
+            // Legacy numInputs field: the compiler only rejects values >= 10 and
+            // otherwise ignores it (matches Intel's reference packer).
+            const uint32_t num_inputs = 2;
+
+            std::vector<uint8_t> container;
+            container.reserve(xml.size() + bin.size() + 24);
+            auto append = [&container](const void* src, size_t len) {
+                const uint8_t* bytes = static_cast<const uint8_t*>(src);
+                container.insert(container.end(), bytes, bytes + len);
+            };
+            const uint16_t ver_major = dev_props.compilerVersion.major;
+            const uint16_t ver_minor = dev_props.compilerVersion.minor;
+            const uint64_t size_xml = xml.size();
+            const uint64_t size_bin = bin.size();
+            append(&ver_major, sizeof(ver_major));
+            append(&ver_minor, sizeof(ver_minor));
+            append(&num_inputs, sizeof(num_inputs));
+            append(&size_xml, sizeof(size_xml));
+            append(xml.data(), xml.size());
+            append(&size_bin, sizeof(size_bin));
+            append(bin.data(), bin.size());
+
+            ze_graph_desc_2_t lite_desc{};
+            lite_desc.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC_2;
+            lite_desc.format = ZE_GRAPH_FORMAT_NGRAPH_LITE;
+            lite_desc.inputSize = container.size();
+            lite_desc.pInput = container.data();
+            // Never null: the driver calls strlen(pBuildFlags) on this path
+            lite_desc.pBuildFlags = "";
+
+            auto t0 = std::chrono::steady_clock::now();
+            check_ze(graph_api_->pfnCreate2(context_, device_, &lite_desc, &graph_), "GraphCreate2(NGRAPH_LITE)");
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+            const char* origin = "compiled by driver";
+            if (graph_api_->pfnGetProperties3 != nullptr &&
+                dev_props.graphExtensionVersion >= ZE_GRAPH_EXT_VERSION_1_12) {
+                ze_graph_properties_3_t props3{};
+                props3.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES_3;
+                if (graph_api_->pfnGetProperties3(graph_, &props3) == ZE_RESULT_SUCCESS &&
+                    (props3.flags & ZE_GRAPH_PROPERTIES_FLAG_LOADED_FROM_CACHE) != 0) {
+                    origin = "loaded from driver cache";
+                }
+            }
+            initialize_graph();
+            std::cout << "  [+] NPU graph " << origin << " in " << ms << " ms: " << p.filename().string() << "\n";
+            return;
         }
 
         fs::create_directories(cache_dir);
@@ -198,6 +385,74 @@ void NpuGraph::init_graph(const std::string& model_path) {
                 std::cout << "  [+] Successfully compiled and cached: " << target_blob.string() << "\n";
             }
         }
+    } else if (ext == ".ngraph_lite") {
+        // Single-file release artifact: patch the compiler version (4 bytes) and,
+        // for shape templates, the placeholder dims inside the embedded XML, then
+        // hand the container straight to the driver compiler. Weights are reused.
+        std::vector<uint8_t> container = read_file_bytes(p);
+        if (container.size() < 24) {
+            throw std::runtime_error("Malformed NGRAPH_LITE container: " + p.string());
+        }
+        auto read_u64 = [&container](size_t offset) {
+            uint64_t value = 0;
+            std::memcpy(&value, container.data() + offset, sizeof(value));
+            return value;
+        };
+        constexpr size_t kXmlOffset = 16; // [u16 major][u16 minor][u32 num][u64 xmlSize]
+        const uint64_t xml_size = read_u64(8);
+        if (xml_size == 0 || kXmlOffset + xml_size + 8 > container.size()) {
+            throw std::runtime_error("Malformed NGRAPH_LITE header: " + p.string());
+        }
+        const uint64_t weights_size = read_u64(kXmlOffset + xml_size);
+        if (kXmlOffset + xml_size + 8 + weights_size > container.size()) {
+            throw std::runtime_error("NGRAPH_LITE content/size mismatch: " + p.string());
+        }
+
+        ze_device_graph_properties_t dev_props{};
+        dev_props.stype = ZE_STRUCTURE_TYPE_DEVICE_GRAPH_PROPERTIES;
+        check_ze(graph_api_->pfnDeviceGetGraphProperties(device_, &dev_props), "DeviceGetGraphProperties");
+        std::memcpy(container.data(), &dev_props.compilerVersion, sizeof(dev_props.compilerVersion));
+
+        std::string xml_text(container.begin() + kXmlOffset, container.begin() + kXmlOffset + xml_size);
+        if (is_shape_template(xml_text)) {
+            bool filled = false;
+            xml_text = fill_template_shape(std::move(xml_text), fill_shape_, filled);
+            if (filled) {
+                std::cout << "  [+] Template filled to " << fill_shape_[2] << "x" << fill_shape_[3]
+                          << ": " << p.filename().string() << "\n";
+            }
+            if (is_shape_template(xml_text) || xml_text.size() != xml_size) {
+                throw std::runtime_error("Template placeholders unresolved: " + p.string());
+            }
+            std::memcpy(container.data() + kXmlOffset, xml_text.data(), xml_text.size());
+        }
+
+        ze_graph_desc_2_t lite_desc{};
+        lite_desc.stype = ZE_STRUCTURE_TYPE_GRAPH_DESC_2;
+        lite_desc.format = ZE_GRAPH_FORMAT_NGRAPH_LITE;
+        lite_desc.inputSize = container.size();
+        lite_desc.pInput = container.data();
+        // Never null: the driver calls strlen(pBuildFlags) on this path
+        lite_desc.pBuildFlags = "";
+
+        auto t0 = std::chrono::steady_clock::now();
+        check_ze(graph_api_->pfnCreate2(context_, device_, &lite_desc, &graph_), "GraphCreate2(NGRAPH_LITE)");
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        const char* origin = "compiled by driver";
+        if (graph_api_->pfnGetProperties3 != nullptr &&
+            dev_props.graphExtensionVersion >= ZE_GRAPH_EXT_VERSION_1_12) {
+            ze_graph_properties_3_t props3{};
+            props3.stype = ZE_STRUCTURE_TYPE_GRAPH_PROPERTIES_3;
+            if (graph_api_->pfnGetProperties3(graph_, &props3) == ZE_RESULT_SUCCESS &&
+                (props3.flags & ZE_GRAPH_PROPERTIES_FLAG_LOADED_FROM_CACHE) != 0) {
+                origin = "loaded from driver cache";
+            }
+        }
+        initialize_graph();
+        std::cout << "  [+] NPU graph " << origin << " in " << ms << " ms: " << p.filename().string() << "\n";
+        return;
     } else {
         target_blob = p;
     }
@@ -224,9 +479,14 @@ void NpuGraph::init_graph(const std::string& model_path) {
     desc.pBuildFlags = nullptr;
 
     check_ze(graph_api_->pfnCreate2(context_, device_, &desc, &graph_), "GraphCreate2");
+    initialize_graph();
+}
 
-    // Initialize Graph on NPU (allocates hardware scratchpad & firmware
-    // structures). The pool's first queue is idle at load time and reused here.
+// Initialize Graph on NPU (allocates hardware scratchpad & firmware
+// structures). The pool's first queue is idle at load time and reused here.
+// TODO: remove if lite graphs are confirmed to work without this explicit
+// initialization (kept for parity with the NATIVE path and Intel's harness).
+void NpuGraph::initialize_graph() {
     ze_command_list_desc_t init_cmd_desc{};
     init_cmd_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
     init_cmd_desc.commandQueueGroupOrdinal = queue_pool_->front().ordinal;
@@ -405,12 +665,15 @@ bool NpuEngine::initialize() {
     return true;
 }
 
-std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path, size_t num_requests) {
+std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path,
+                                               size_t num_requests,
+                                               std::span<const int64_t> fill_shape) {
     if (!initialize()) {
         throw std::runtime_error("NpuEngine initialization failed.");
     }
     ensure_queue_pool(num_requests);
-    return std::make_shared<NpuGraph>(context_, device_, &queue_pool_, model_path, graph_api_, num_requests);
+    return std::make_shared<NpuGraph>(context_, device_, &queue_pool_, model_path, graph_api_, num_requests,
+                                      use_lite_, fill_shape);
 }
 
 } // namespace ppocr

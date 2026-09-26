@@ -8,6 +8,7 @@
 #include "wic_decoder.hpp"
 
 #include <windows.h>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -27,13 +28,14 @@ void print_usage(const char* prog) {
     std::cout << "  --image <path>         Path to input image file (JPG, PNG, BMP, TIFF, WebP)\n";
     std::cout << "  --clipboard            Read image directly from Windows Clipboard\n";
     std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_640x640.xml]\n";
-    std::cout << "  --rec-160 <path>       Path to Rec W=160 model [default: models/ppocrv6_small_rec_w160.xml]\n";
-    std::cout << "  --rec-320 <path>       Path to Rec W=320 model [default: models/ppocrv6_small_rec_w320.xml]\n";
-    std::cout << "  --rec-640 <path>       Path to Rec W=640 model [default: models/ppocrv6_small_rec_w640.xml]\n";
+    std::cout << "  --rec-160 <path>       Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w160.xml]\n";
+    std::cout << "  --rec-320 <path>       Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w320.xml]\n";
+    std::cout << "  --rec-640 <path>       Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w640.xml]\n";
     std::cout << "  --dict <path>          Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
     std::cout << "  --slice                Force tiling slicing for large images\n";
     std::cout << "  --rec-poll             Poll both rec slots for a finished request instead of fixed alternation\n";
     std::cout << "  --rec-depth <n>        Number of in-flight rec requests per graph (default 2)\n";
+    std::cout << "  --lite                 Load .xml+.bin via driver JIT (NGRAPH_LITE), skip local blob cache\n";
     std::cout << "  --profile, -p          Print detailed end-to-end performance breakdown\n";
     std::cout << "  --help, -h             Show this help message\n";
 }
@@ -72,6 +74,7 @@ int main(int argc, char* argv[]) {
         std::string dict_path = "models/ppocr_keys_v1.txt";
         bool force_slice = false;
         bool rec_poll = false;
+        bool use_lite = false;
         int rec_depth = 2;
         ppocr::ProfileMetrics metrics;
 
@@ -99,6 +102,8 @@ int main(int argc, char* argv[]) {
                 rec_depth = std::atoi(argv[++i]);
                 if (rec_depth < 1) rec_depth = 1;
                 if (rec_depth > 8) rec_depth = 8;
+            } else if (arg == "--lite") {
+                use_lite = true;
             } else if (arg == "--profile" || arg == "-p") {
                 metrics.enabled = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -154,15 +159,21 @@ int main(int argc, char* argv[]) {
             std::cerr << "[-] NPU initialization failed.\n";
             return 1;
         }
+        engine.set_ngraph_lite(use_lite);
 
         // 3. Load Models
+        constexpr std::array<int64_t, 4> kDetFill{1, 3, 640, 640};
+        constexpr std::array<int64_t, 4> kRec160Fill{1, 3, 48, 160};
+        constexpr std::array<int64_t, 4> kRec320Fill{1, 3, 48, 320};
+        constexpr std::array<int64_t, 4> kRec640Fill{1, 3, 48, 640};
+
         std::cout << "[*] Loading Detection model onto NPU: " << det_model << "..." << std::endl;
-        auto det_graph = engine.load_model(det_model, 2); // 2-deep tile pipeline (submit-ahead)
+        auto det_graph = engine.load_model(det_model, 2, kDetFill); // 2-deep tile pipeline (submit-ahead)
 
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
-        auto rec_graph_160 = fs::exists(rec_160) ? engine.load_model(rec_160, rec_depth) : nullptr;
-        auto rec_graph_320 = fs::exists(rec_320) ? engine.load_model(rec_320, rec_depth) : nullptr;
-        auto rec_graph_640 = fs::exists(rec_640) ? engine.load_model(rec_640, rec_depth) : nullptr;
+        auto rec_graph_160 = fs::exists(rec_160) ? engine.load_model(rec_160, rec_depth, kRec160Fill) : nullptr;
+        auto rec_graph_320 = fs::exists(rec_320) ? engine.load_model(rec_320, rec_depth, kRec320Fill) : nullptr;
+        auto rec_graph_640 = fs::exists(rec_640) ? engine.load_model(rec_640, rec_depth, kRec640Fill) : nullptr;
 
         ppocr::CtcDecoder ctc_decoder(dict_path);
 

@@ -20,6 +20,8 @@ Applies the following optimizations:
 
 import argparse
 import os
+import re
+import shutil
 import struct
 import sys
 import time
@@ -32,23 +34,60 @@ import openvino.runtime.passes as passes
 
 def package_ngraph_lite(xml_path: Path, bin_path: Path, output_path: Path):
     """
-    Packages XML and BIN into an NGRAPH_LITE container for Level Zero pfnCreate3.
-    Protocol format:
-      [0..3]   : uint16 major (1), uint16 minor (1) -> 0x00010001
-      [4..7]   : uint32 xml_length
-      [8..15]  : uint64 bin_length
-      [16..]   : xml_data + bin_data
+    Packages XML and BIN into the NGRAPH_LITE container consumed by the driver
+    compiler (see vpux_compiler/frontend/xml_deserializer.cpp):
+      [0..3]   : uint16 major, uint16 minor   (placeholder; the CLI overwrites
+                 this at load time with the currently installed compiler version)
+      [4..7]   : uint32 numOfElements         (bounds-checked only)
+      [8..15]  : uint64 xml_size
+      [16..]   : xml_data
+      [..+8]   : uint64 weights_size
+      [..]     : weights_data
     """
     xml_bytes = xml_path.read_bytes()
     bin_bytes = bin_path.read_bytes()
 
-    header = struct.pack("<HHIQ", 1, 1, len(xml_bytes), len(bin_bytes))
+    num_elements = 2
+    header = struct.pack("<HHIQ", 1, 1, num_elements, len(xml_bytes))
     with open(output_path, "wb") as f:
         f.write(header)
         f.write(xml_bytes)
+        f.write(struct.pack("<Q", len(bin_bytes)))
         f.write(bin_bytes)
 
     print(f"  [+] Packaged NGRAPH_LITE: {output_path.name} ({output_path.stat().st_size / 1024 / 1024:.2f} MB)")
+
+
+def make_shape_template(src_xml: Path, dst_xml: Path, template_dims: list):
+    """
+    Derives a shape template from a concrete model: the input Parameter layer's
+    dims are replaced by fixed 4-digit placeholders (e.g. "0000") and every
+    <dim> entry is removed (port caches are inert for known-op models; only the
+    data shape attribute is consumed). The weights bin is reused byte-for-byte,
+    and a NGRAPH_LITE container of the template is emitted next to it.
+    """
+    text = src_xml.read_text(encoding="utf-8")
+    start = text.find('type="Parameter"')
+    end = text.find("</layer>", start)
+    if start < 0 or end < 0:
+        raise RuntimeError(f"Parameter layer not found in {src_xml}")
+
+    block = text[start:end]
+    match = re.search(r'shape="([^"]+)"', block)
+    if not match:
+        raise RuntimeError(f"Parameter shape attribute not found in {src_xml}")
+    old_dims = match.group(1).split(",")
+    if len(old_dims) != len(template_dims):
+        raise RuntimeError(f"Shape rank mismatch: {old_dims} vs {template_dims}")
+
+    block = block[: match.start(1)] + ",".join(template_dims) + block[match.end(1):]
+    block = re.sub(r"\s*<dim>-?\d+</dim>\r?\n", "\n", block)
+
+    rest = re.sub(r"\s*<dim>-?\d+</dim>\r?\n", "\n", text[end:])
+    dst_xml.write_text(text[:start] + block + rest, encoding="utf-8")
+    shutil.copyfile(src_xml.with_suffix(".bin"), dst_xml.with_suffix(".bin"))
+    package_ngraph_lite(dst_xml, dst_xml.with_suffix(".bin"), dst_xml.with_suffix(".ngraph_lite"))
+    print(f"  [+] Shape template: {dst_xml.name} ({dst_xml.stat().st_size / 1024:.1f} KB, bin reused)")
 
 
 def optimize_det_model(onnx_path: Path, output_dir: Path, size: int = 640) -> tuple[Path, Path]:
@@ -131,6 +170,7 @@ def main():
     parser.add_argument("--det-size", type=int, default=640, help="Detection resolution (default 640 for optimal performance)")
     parser.add_argument("--rec-widths", nargs="+", type=int, default=[160, 320, 640], help="Recognition width buckets")
     parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries for NPU")
+    parser.add_argument("--no-templates", action="store_true", help="Skip shape template generation (.xml/.bin/.ngraph_lite)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -165,6 +205,21 @@ def main():
         if args.compile_blobs:
             rec_blob = args.output_dir / f"ppocrv6_small_rec_w{width}.blob"
             compile_npu_blob(rec_xml, rec_blob)
+
+    # 2b. Shape templates: readable xml/bin for development + single-file NGRAPH_LITE
+    if not args.no_templates:
+        print("\n[2b/3] Building shape templates...")
+        make_shape_template(
+            args.output_dir / f"ppocrv6_small_det_{args.det_size}x{args.det_size}.xml",
+            args.output_dir / "ppocrv6_small_det_template.xml",
+            ["1", "3", "0000", "0000"],
+        )
+        ref_width = 320 if 320 in args.rec_widths else args.rec_widths[0]
+        make_shape_template(
+            args.output_dir / f"ppocrv6_small_rec_w{ref_width}.xml",
+            args.output_dir / "ppocrv6_small_rec_template.xml",
+            ["1", "3", "48", "0000"],
+        )
 
     # 3. Export character dictionary directly from inference.yml
     dict_dest = args.output_dir / "ppocr_keys_v1.txt"

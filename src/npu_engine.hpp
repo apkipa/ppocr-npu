@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -85,7 +86,9 @@ public:
         std::vector<QueueSlot>* queue_pool,
         const std::string& model_path,
         ze_graph_dditable_ext_t* graph_api,
-        size_t num_requests = 2 // in-flight software pipeline depth per graph
+        size_t num_requests = 2,       // in-flight software pipeline depth per graph
+        bool use_lite = false,         // load .xml+.bin via driver JIT (NGRAPH_LITE)
+        std::span<const int64_t> fill_shape = {} // concrete dims for 4-digit shape templates
     );
     ~NpuGraph();
 
@@ -98,6 +101,7 @@ public:
 
 private:
     void init_graph(const std::string& model_path);
+    void initialize_graph();
     void query_arguments();
 
     ze_context_handle_t context_;
@@ -109,6 +113,8 @@ private:
     std::vector<TensorDesc> inputs_;
     std::vector<TensorDesc> outputs_;
     std::vector<std::unique_ptr<NpuInferRequest>> requests_;
+    bool use_lite_ = false;
+    std::vector<int64_t> fill_shape_;
 };
 
 // Singleton context managing the Intel NPU Level Zero driver
@@ -118,7 +124,13 @@ public:
 
     bool initialize();
 
-    std::shared_ptr<NpuGraph> load_model(const std::string& model_path, size_t num_requests = 2);
+    // Loads .xml+.bin through the driver's JIT compiler (NGRAPH_LITE) instead
+    // of a pre-compiled NATIVE blob; the driver's disk cache is reused.
+    void set_ngraph_lite(bool enabled) { use_lite_ = enabled; }
+
+    std::shared_ptr<NpuGraph> load_model(const std::string& model_path,
+                                         size_t num_requests = 2,
+                                         std::span<const int64_t> fill_shape = {});
 
     ze_context_handle_t context() const { return context_; }
     ze_device_handle_t device() const { return device_; }
@@ -140,6 +152,7 @@ private:
     uint32_t queue_ordinal_ = 0;
     std::vector<QueueSlot> queue_pool_;
     ze_graph_dditable_ext_t* graph_api_ = nullptr;
+    bool use_lite_ = false;
     std::string device_name_ = "Unknown NPU";
 };
 
