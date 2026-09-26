@@ -35,7 +35,8 @@ void print_usage(const char* prog) {
     std::cout << "  --slice                Force tiling slicing for large images\n";
     std::cout << "  --rec-poll             Poll both rec slots for a finished request instead of fixed alternation\n";
     std::cout << "  --rec-depth <n>        Number of in-flight rec requests per graph (default 2)\n";
-    std::cout << "  --lite                 Load .xml+.bin via driver JIT (NGRAPH_LITE), skip local blob cache\n";
+    std::cout << "  --native               Use the local NATIVE blob cache (cache/*.blob) instead of NGRAPH_LITE\n";
+    std::cout << "  --driver-cache         Use the driver disk cache instead of the cache/lite/ blob cache\n";
     std::cout << "  --profile, -p          Print detailed end-to-end performance breakdown\n";
     std::cout << "  --help, -h             Show this help message\n";
 }
@@ -74,7 +75,8 @@ int main(int argc, char* argv[]) {
         std::string dict_path = "models/ppocr_keys_v1.txt";
         bool force_slice = false;
         bool rec_poll = false;
-        bool use_lite = false;
+        bool use_lite = true;
+        bool blob_cache = true;
         int rec_depth = 2;
         ppocr::ProfileMetrics metrics;
 
@@ -102,8 +104,10 @@ int main(int argc, char* argv[]) {
                 rec_depth = std::atoi(argv[++i]);
                 if (rec_depth < 1) rec_depth = 1;
                 if (rec_depth > 8) rec_depth = 8;
-            } else if (arg == "--lite") {
-                use_lite = true;
+            } else if (arg == "--native") {
+                use_lite = false;
+            } else if (arg == "--driver-cache") {
+                blob_cache = false;
             } else if (arg == "--profile" || arg == "-p") {
                 metrics.enabled = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -160,6 +164,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         engine.set_ngraph_lite(use_lite);
+        engine.set_manual_blob_cache(blob_cache);
+        if (metrics.enabled) engine.print_memory_usage("[baseline]");
 
         // 3. Load Models
         constexpr std::array<int64_t, 4> kDetFill{1, 3, 640, 640};
@@ -169,11 +175,15 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[*] Loading Detection model onto NPU: " << det_model << "..." << std::endl;
         auto det_graph = engine.load_model(det_model, 2, kDetFill); // 2-deep tile pipeline (submit-ahead)
+        if (metrics.enabled) engine.print_memory_usage("[after det]");
 
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
         auto rec_graph_160 = fs::exists(rec_160) ? engine.load_model(rec_160, rec_depth, kRec160Fill) : nullptr;
+        if (metrics.enabled) engine.print_memory_usage("[after rec160]");
         auto rec_graph_320 = fs::exists(rec_320) ? engine.load_model(rec_320, rec_depth, kRec320Fill) : nullptr;
+        if (metrics.enabled) engine.print_memory_usage("[after rec320]");
         auto rec_graph_640 = fs::exists(rec_640) ? engine.load_model(rec_640, rec_depth, kRec640Fill) : nullptr;
+        if (metrics.enabled) engine.print_memory_usage("[after rec640]");
 
         ppocr::CtcDecoder ctc_decoder(dict_path);
 

@@ -88,7 +88,8 @@ public:
         ze_graph_dditable_ext_t* graph_api,
         size_t num_requests = 2,       // in-flight software pipeline depth per graph
         bool use_lite = false,         // load .xml+.bin via driver JIT (NGRAPH_LITE)
-        std::span<const int64_t> fill_shape = {} // concrete dims for 4-digit shape templates
+        std::span<const int64_t> fill_shape = {}, // concrete dims for 4-digit shape templates
+        bool manual_blob_cache = false // disable driver cache, keep blobs in cache/lite/
     );
     ~NpuGraph();
 
@@ -104,6 +105,15 @@ private:
     void initialize_graph();
     void query_arguments();
 
+    // Manual blob cache: compiled NGRAPH_LITE graphs are exported with
+    // pfnGetNativeBinary2 and reloaded as NATIVE blobs (driver cache disabled).
+    bool load_manual_blob_cache(const std::string& blob_path, bool fresh, const std::string& name);
+    bool store_manual_blob_cache(const std::string& blob_path, const std::string& name);
+    // Creates a NATIVE graph directly from a read-only mmap of `path`. The
+    // driver copies the blob during graph init, so the mapping is released as
+    // soon as the graph is initialized (no pinned pages, no private vector).
+    bool try_create_mapped(const std::string& path, const std::string& name);
+
     ze_context_handle_t context_;
     ze_device_handle_t device_;
     std::vector<QueueSlot>* queue_pool_ = nullptr;
@@ -115,6 +125,7 @@ private:
     std::vector<std::unique_ptr<NpuInferRequest>> requests_;
     bool use_lite_ = false;
     std::vector<int64_t> fill_shape_;
+    bool manual_blob_cache_ = false;
 };
 
 // Singleton context managing the Intel NPU Level Zero driver
@@ -127,6 +138,13 @@ public:
     // Loads .xml+.bin through the driver's JIT compiler (NGRAPH_LITE) instead
     // of a pre-compiled NATIVE blob; the driver's disk cache is reused.
     void set_ngraph_lite(bool enabled) { use_lite_ = enabled; }
+
+    // Skips the driver-managed disk cache (ZE_GRAPH_FLAG_DISABLE_CACHING) and
+    // keeps compiled blobs in the project's own cache/lite/ directory instead.
+    void set_manual_blob_cache(bool enabled) { manual_blob_cache_ = enabled; }
+
+    // Prints per-context NPU memory usage (DDR / driver cache / program cache).
+    void print_memory_usage(const char* tag = "");
 
     std::shared_ptr<NpuGraph> load_model(const std::string& model_path,
                                          size_t num_requests = 2,
@@ -153,6 +171,7 @@ private:
     std::vector<QueueSlot> queue_pool_;
     ze_graph_dditable_ext_t* graph_api_ = nullptr;
     bool use_lite_ = false;
+    bool manual_blob_cache_ = false;
     std::string device_name_ = "Unknown NPU";
 };
 

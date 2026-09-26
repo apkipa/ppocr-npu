@@ -19,6 +19,7 @@ cmake_install.cmake
 
 # Models and temporary artifacts
 models/
+cache/
 *.bin
 *.blob
 *.ngraph_lite

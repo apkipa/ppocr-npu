@@ -282,3 +282,11 @@ PP-OCRv6 Rec 存在固定的 $8\times$ 下采样，时间步长 $T = W / 8$。�
 * **发布形态**：只带 `models/*.ngraph_lite`（单文件，含 slim 模板或静态图 + 权重），**不带 xml/bin**；xml/bin 仅作开发期可读源与手工改形状用；
 * **CLI 就地 patch**：加载 `.ngraph_lite` 时覆写 4 字节编译器版本（来自 `pfnDeviceGetGraphProperties`，满足 `xml_deserializer.cpp:78` 的强校验），模板再等长覆盖形状占位（`0000`→`0160` 等），权重段原样复用；随后 `pfnCreate2(NGRAPH_LITE)`；
 * **脚本自动生成**：`build_models.py` 修正 packer 后自动产出静态/模板两类 `.ngraph_lite`（`--no-templates` 可跳过模板）；模板删除**全部** `<dim>`（含 Parameter 端口缓存，已知算子的 port dims 均惰性，源码依据 `xml_deserialize_util.cpp:1160-1310`），唯一占位与填充点都是 `data` 的 `shape` 属性；
+
+### 6. 默认加载形态：NGRAPH_LITE + 手动 blob 缓存（mmap 只读重载）
+* **默认路径**：`use_lite=true` + `manual_blob_cache=true`；驱动磁盘缓存默认关闭（`lite_desc.flags = ZE_GRAPH_FLAG_DISABLE_CACHING`），编译产物存 `cache/lite/<stem>_<fill>.blob`；
+* **缓存判定**：稳定文件名 + `last_write_time(blob) >= last_write_time(源文件)`（与 NATIVE `cache/<stem>.blob` 同一规则）；无哈希、无旁挂元数据文件；失效即重编译同名覆盖；
+* **冷启动**：`pfnCreate2(NGRAPH_LITE)` 编译并初始化 → `pfnGetNativeBinary2` 导出 ELF 写缓存 → 销毁 lite 图 → 改用 mmap 重载的 NATIVE 图；**写缓存失败则保留纯 lite 图**（回退）；
+* **热启动**：只读 `CreateFileMapping/MapViewOfFile` 映射 blob → `pfnCreate2(NATIVE)` → 驱动在 `initialize_graph()` 期间把 blob 拷走 → 返回即 `UnmapViewOfFile`；热路径**不读 xml/bin**（仅 stat + 映射 + 建图）；
+* **为何不用 `ZE_GRAPH_FLAG_INPUT_GRAPH_PERSISTENT`（零拷贝）**：页对齐 `inputSize` 后该路径可用（未页对齐时驱动返回 `0x7800000A ZE_RESULT_ERROR_UNSUPPORTED_ALIGNMENT`），但实测零拷贝把整份 blob（4 图 ~54MB）钉在进程工作集，启动/私有内存/设备 DDR 均无收益；`zeMemAllocHost` 外部内存导入更贵（+87ms），已弃用；
+* **实测（4 图 blank 热启动，12 轮配对）**：默认 mmap ≈ 179.7ms（比原生预编译 blob 快 ~20ms、比驱动缓存模式快 ~55ms）；PeakPrivate 58MB（原生 vector 71.8MB、驱动缓存 74.8MB）；PeakWS 160MB；NPU DDR 120,868 KB（四种加载方式逐图完全相同，设备侧与主机加载方式无关）；
