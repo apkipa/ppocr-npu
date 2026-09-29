@@ -6,6 +6,9 @@
 
 #include <ze_api.h>
 #include <ze_graph_ext.h>
+#include <ze_graph_profiling_ext.h>
+
+#include "profiler.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -20,6 +23,14 @@ struct TensorDesc {
     std::vector<uint32_t> dims;
     size_t total_bytes = 0;
     bool is_input = true;
+};
+
+struct NpuGraphLoadStats {
+    double graph_init_ms = 0.0;
+    double profiling_blob_export_ms = 0.0;
+    double argument_query_ms = 0.0;
+    double request_pool_ms = 0.0;
+    double total_ms = 0.0;
 };
 
 // Shared queue pool slot. Request index -> pool index; at most one in-flight
@@ -42,7 +53,11 @@ public:
         ze_graph_handle_t graph,
         const std::vector<TensorDesc>& inputs,
         const std::vector<TensorDesc>& outputs,
-        ze_graph_dditable_ext_t* graph_api
+        ze_graph_dditable_ext_t* graph_api,
+        ze_graph_profiling_dditable_ext_t* profiling_api = nullptr,
+        TraceRecorder* trace = nullptr,
+        std::string graph_name = {},
+        size_t request_index = 0
     );
     ~NpuInferRequest();
 
@@ -66,6 +81,10 @@ private:
     ze_command_queue_handle_t queue_;
     ze_graph_handle_t graph_;
     ze_graph_dditable_ext_t* graph_api_;
+    ze_graph_profiling_dditable_ext_t* profiling_api_ = nullptr;
+    TraceRecorder* trace_ = nullptr;
+    std::string graph_name_;
+    size_t request_index_ = 0;
 
     std::vector<TensorDesc> input_descs_;
     std::vector<TensorDesc> output_descs_;
@@ -75,6 +94,19 @@ private:
 
     ze_command_list_handle_t command_list_ = nullptr;
     ze_fence_handle_t fence_ = nullptr;
+    ze_graph_profiling_pool_handle_t profiling_pool_ = nullptr;
+    ze_graph_profiling_query_handle_t profiling_query_ = nullptr;
+    uint64_t* command_timestamp_before_ = nullptr;
+    uint64_t* command_timestamp_after_ = nullptr;
+    uint64_t command_before_tick_ = 0;
+    uint64_t command_after_tick_ = 0;
+    TraceRecorder::TimePoint submit_start_{};
+    TraceRecorder::TimePoint submit_end_{};
+    bool in_flight_ = false;
+
+    void collect_profile(TraceRecorder::TimePoint completion);
+    void destroy_profile_query();
+    void record_command_timestamps();
 };
 
 // Manages a compiled model instance on NPU
@@ -89,7 +121,9 @@ public:
         size_t num_requests = 2,       // in-flight software pipeline depth per graph
         bool use_lite = false,         // load .xml+.bin via driver JIT (NGRAPH_LITE)
         std::span<const int64_t> fill_shape = {}, // concrete dims for 4-digit shape templates
-        bool manual_blob_cache = false // disable driver cache, keep blobs in cache/lite/
+        bool manual_blob_cache = false, // disable driver cache, keep blobs in cache/lite/
+        ze_graph_profiling_dditable_ext_t* profiling_api = nullptr,
+        TraceRecorder* trace = nullptr
     );
     ~NpuGraph();
 
@@ -99,6 +133,7 @@ public:
 
     const std::vector<TensorDesc>& inputs() const { return inputs_; }
     const std::vector<TensorDesc>& outputs() const { return outputs_; }
+    const NpuGraphLoadStats& load_stats() const { return load_stats_; }
 
 private:
     void init_graph(const std::string& model_path);
@@ -126,6 +161,10 @@ private:
     bool use_lite_ = false;
     std::vector<int64_t> fill_shape_;
     bool manual_blob_cache_ = false;
+    ze_graph_profiling_dditable_ext_t* profiling_api_ = nullptr;
+    TraceRecorder* trace_ = nullptr;
+    std::string graph_name_;
+    NpuGraphLoadStats load_stats_;
 };
 
 // Singleton context managing the Intel NPU Level Zero driver
@@ -150,8 +189,15 @@ public:
     // Must be set before the queue pool is created (i.e. before load_model()).
     void set_turbo(bool enabled) { turbo_ = enabled; }
 
-    // Prints per-context NPU memory usage (DDR / driver cache / program cache).
+    void set_trace_recorder(TraceRecorder* trace);
+
+    // Prints active NPU/context allocation usage. Cache statistics are separate
+    // because querying them can scan driver-managed cache state.
     void print_memory_usage(const char* tag = "");
+
+    // Prints driver/program cache statistics. This is diagnostic-only and is
+    // intentionally not part of the normal inference profile.
+    void print_cache_usage(const char* tag = "");
 
     std::shared_ptr<NpuGraph> load_model(const std::string& model_path,
                                          size_t num_requests = 2,
@@ -177,11 +223,13 @@ private:
     uint32_t queue_ordinal_ = 0;
     std::vector<QueueSlot> queue_pool_;
     ze_graph_dditable_ext_t* graph_api_ = nullptr;
+    ze_graph_profiling_dditable_ext_t* profiling_api_ = nullptr;
     bool use_lite_ = false;
     bool manual_blob_cache_ = false;
     bool turbo_ = false;
     bool turbo_supported_ = false;
     bool turbo_warned_ = false;
+    TraceRecorder* trace_ = nullptr;
     std::string device_name_ = "Unknown NPU";
 };
 

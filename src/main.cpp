@@ -8,10 +8,13 @@
 #include "wic_decoder.hpp"
 
 #include <windows.h>
+#include <algorithm>
 #include <array>
-#include <cstdlib>
+#include <charconv>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,19 +31,24 @@ void print_usage(const char* prog) {
     std::cout << "  --image <path>         Path to input image file (JPG, PNG, BMP, TIFF, WebP)\n";
     std::cout << "  --clipboard            Read image directly from Windows Clipboard\n";
     std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_template.xml]\n";
-    std::cout << "  --det-960              Downscale long side to <=960 (round to 32) and run a single 960x960 det bucket\n";
-    std::cout << "  --rec-160 <path>       Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w160.xml]\n";
-    std::cout << "  --rec-320 <path>       Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w320.xml]\n";
-    std::cout << "  --rec-640 <path>       Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_w640.xml]\n";
-    std::cout << "  --dict <path>          Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
-    std::cout << "  --slice                Force tiling slicing for large images\n";
-    std::cout << "  --rec-poll             Poll both rec slots for a finished request instead of fixed alternation\n";
-    std::cout << "  --rec-depth <n>        Number of in-flight rec requests per graph (default 2)\n";
-    std::cout << "  --native               Use the local NATIVE blob cache (cache/*.blob) instead of NGRAPH_LITE\n";
-    std::cout << "  --driver-cache         Use the driver disk cache instead of the cache/lite/ blob cache\n";
-    std::cout << "  --turbo                Low-latency command queues (max NPU clocks, no idle downclock; higher power)\n";
-    std::cout << "  --profile, -p          Print detailed end-to-end performance breakdown\n";
-    std::cout << "  --help, -h             Show this help message\n";
+    std::cout << "  --det-mode <mode>      Detection mode: resize or tile (default resize)\n";
+    std::cout << "  --tile-size <n>        Tile edge length in pixels (multiple of 32, 32-960; default 960)\n";
+    std::cout << "  --rec-model-160 <path> Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
+    std::cout << "  --rec-model-320 <path> Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
+    std::cout << "  --rec-model-640 <path> Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
+    std::cout << "  --dictionary <path>    Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
+    std::cout << "  --rec-scheduling <mode> Request selection: round-robin or poll (poll requires inflight=2)\n";
+    std::cout << "  --rec-inflight <n>     In-flight requests per recognition graph (default 2, range 1-8)\n";
+    std::cout << "  --graph-format <name>  XML compilation format: ngraph-lite or native-blob (default ngraph-lite)\n";
+    std::cout << "  --cache-backend <name> Compilation cache: app or driver (default app)\n";
+    std::cout << "  --npu-low-latency      Request low-latency command queues (higher power)\n";
+    std::cout << "  --profile              Print detailed end-to-end performance breakdown\n";
+    std::cout << "  --trace <path>         Export host/NPU task timeline as Chrome Trace JSON\n";
+    std::cout << "  --trace-mode <mode>    Trace detail: tasks or timestamps (default tasks)\n";
+    std::cout << "  --trace-raw-dir <path> Dump RAW profiles and profiled graph blobs (tasks mode only)\n";
+    std::cout << "  --det-heatmap-dir <path>  Save detector probability heatmap as PGM (diagnostic)\n";
+    std::cout << "  --cache-stats          Print driver/program cache statistics (slow diagnostic query)\n";
+    std::cout << "  --help                 Show this help message\n";
 }
 
 std::wstring to_wstring(const std::string& str) {
@@ -50,6 +58,30 @@ std::wstring to_wstring(const std::string& str) {
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &wstr[0], size);
     if (!wstr.empty() && wstr.back() == 0) wstr.pop_back();
     return wstr;
+}
+
+bool save_probability_pgm(const float* probabilities, int width, int height, const fs::path& path) {
+    std::error_code directory_error;
+    fs::create_directories(path.parent_path(), directory_error);
+    if (directory_error) return false;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << "P5\n" << width << ' ' << height << "\n255\n";
+
+    std::vector<uint8_t> row(static_cast<size_t>(width));
+    for (int y = 0; y < height; ++y) {
+        const size_t offset = static_cast<size_t>(y) * width;
+        for (int x = 0; x < width; ++x) {
+            const float probability = std::clamp(probabilities[offset + x], 0.0f, 1.0f);
+            row[static_cast<size_t>(x)] = static_cast<uint8_t>(probability * 255.0f + 0.5f);
+        }
+        out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+    return static_cast<bool>(out);
+}
+
+bool save_heatmap_pgm(const ppocr::ProbHeatmap& heatmap, const fs::path& path) {
+    return save_probability_pgm(heatmap.data().data(), heatmap.width(), heatmap.height(), path);
 }
 
 } // namespace
@@ -71,58 +103,126 @@ int main(int argc, char* argv[]) {
         };
 
         std::string det_model = resolve_model("models/ppocrv6_small_det_template");
-        std::string rec_160 = resolve_model("models/ppocrv6_small_rec_w160");
-        std::string rec_320 = resolve_model("models/ppocrv6_small_rec_w320");
-        std::string rec_640 = resolve_model("models/ppocrv6_small_rec_w640");
+        std::string rec_template = resolve_model("models/ppocrv6_small_rec_template");
+        std::string rec_160 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w160");
+        std::string rec_320 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w320");
+        std::string rec_640 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w640");
         std::string dict_path = "models/ppocr_keys_v1.txt";
-        bool force_slice = false;
+        std::string trace_path;
+        std::string trace_raw_dir;
+        std::string det_heatmap_dir;
+        bool task_trace = true;
         bool rec_poll = false;
         bool use_lite = true;
         bool blob_cache = true;
-        bool det_960 = false;
-        bool turbo = false;
+        enum class DetMode { Resize, Tile };
+        DetMode det_mode = DetMode::Resize;
+        bool tile_size_explicit = false;
+        int det_size = 960;
+        bool low_latency = false;
+        bool cache_stats = false;
         int rec_depth = 2;
         ppocr::ProfileMetrics metrics;
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--image" && i + 1 < argc) {
+            if (arg == "--image") {
+                if (i + 1 >= argc) throw std::invalid_argument("--image requires a path");
                 image_path = argv[++i];
             } else if (arg == "--clipboard") {
                 from_clipboard = true;
-            } else if (arg == "--det-model" && i + 1 < argc) {
+            } else if (arg == "--det-model") {
+                if (i + 1 >= argc) throw std::invalid_argument("--det-model requires a path");
                 det_model = argv[++i];
-            } else if (arg == "--rec-160" && i + 1 < argc) {
+            } else if (arg == "--det-mode") {
+                if (i + 1 >= argc) throw std::invalid_argument("--det-mode requires 'resize' or 'tile'");
+                const std::string value = argv[++i];
+                if (value == "resize") det_mode = DetMode::Resize;
+                else if (value == "tile") det_mode = DetMode::Tile;
+                else throw std::invalid_argument("--det-mode must be 'resize' or 'tile'");
+            } else if (arg == "--tile-size") {
+                if (i + 1 >= argc) throw std::invalid_argument("--tile-size requires a pixel size");
+                const std::string value = argv[++i];
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), det_size);
+                if (error != std::errc{} || end != value.data() + value.size())
+                    throw std::invalid_argument("--tile-size must be an integer");
+                tile_size_explicit = true;
+            } else if (arg == "--rec-model-160") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-model-160 requires a path");
                 rec_160 = argv[++i];
-            } else if (arg == "--rec-320" && i + 1 < argc) {
+            } else if (arg == "--rec-model-320") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-model-320 requires a path");
                 rec_320 = argv[++i];
-            } else if (arg == "--rec-640" && i + 1 < argc) {
+            } else if (arg == "--rec-model-640") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-model-640 requires a path");
                 rec_640 = argv[++i];
-            } else if (arg == "--dict" && i + 1 < argc) {
+            } else if (arg == "--dictionary") {
+                if (i + 1 >= argc) throw std::invalid_argument("--dictionary requires a path");
                 dict_path = argv[++i];
-            } else if (arg == "--slice") {
-                force_slice = true;
-            } else if (arg == "--rec-poll") {
-                rec_poll = true;
-            } else if (arg == "--rec-depth" && i + 1 < argc) {
-                rec_depth = std::atoi(argv[++i]);
-                if (rec_depth < 1) rec_depth = 1;
-                if (rec_depth > 8) rec_depth = 8;
-            } else if (arg == "--native") {
-                use_lite = false;
-            } else if (arg == "--driver-cache") {
-                blob_cache = false;
-            } else if (arg == "--det-960") {
-                det_960 = true;
-            } else if (arg == "--turbo") {
-                turbo = true;
-            } else if (arg == "--profile" || arg == "-p") {
+            } else if (arg == "--rec-scheduling") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-scheduling requires 'round-robin' or 'poll'");
+                const std::string value = argv[++i];
+                if (value == "round-robin") rec_poll = false;
+                else if (value == "poll") rec_poll = true;
+                else throw std::invalid_argument("--rec-scheduling must be 'round-robin' or 'poll'");
+            } else if (arg == "--rec-inflight") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-inflight requires a number from 1 through 8");
+                const std::string value = argv[++i];
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), rec_depth);
+                if (error != std::errc{} || end != value.data() + value.size() || rec_depth < 1 || rec_depth > 8)
+                    throw std::invalid_argument("--rec-inflight must be an integer from 1 through 8");
+            } else if (arg == "--graph-format") {
+                if (i + 1 >= argc) throw std::invalid_argument("--graph-format requires 'ngraph-lite' or 'native-blob'");
+                const std::string value = argv[++i];
+                if (value == "ngraph-lite") use_lite = true;
+                else if (value == "native-blob") use_lite = false;
+                else throw std::invalid_argument("--graph-format must be 'ngraph-lite' or 'native-blob'");
+            } else if (arg == "--cache-backend") {
+                if (i + 1 >= argc) throw std::invalid_argument("--cache-backend requires 'app' or 'driver'");
+                const std::string value = argv[++i];
+                if (value == "app") blob_cache = true;
+                else if (value == "driver") blob_cache = false;
+                else throw std::invalid_argument("--cache-backend must be 'app' or 'driver'");
+            } else if (arg == "--npu-low-latency") {
+                low_latency = true;
+            } else if (arg == "--profile") {
                 metrics.enabled = true;
-            } else if (arg == "--help" || arg == "-h") {
+            } else if (arg == "--trace") {
+                if (i + 1 >= argc) throw std::invalid_argument("--trace requires an output path");
+                trace_path = argv[++i];
+            } else if (arg == "--trace-mode") {
+                if (i + 1 >= argc) throw std::invalid_argument("--trace-mode requires 'tasks' or 'timestamps'");
+                const std::string value = argv[++i];
+                if (value == "tasks") task_trace = true;
+                else if (value == "timestamps") task_trace = false;
+                else throw std::invalid_argument("--trace-mode must be 'tasks' or 'timestamps'");
+            } else if (arg == "--trace-raw-dir") {
+                if (i + 1 >= argc) throw std::invalid_argument("--trace-raw-dir requires a directory path");
+                trace_raw_dir = argv[++i];
+            } else if (arg == "--det-heatmap-dir") {
+                if (i + 1 >= argc) throw std::invalid_argument("--det-heatmap-dir requires a directory path");
+                det_heatmap_dir = argv[++i];
+            } else if (arg == "--cache-stats") {
+                cache_stats = true;
+            } else if (arg == "--help") {
                 print_usage(argv[0]);
                 return 0;
+            } else {
+                throw std::invalid_argument("unknown option: " + arg);
             }
         }
+
+        if (tile_size_explicit && det_mode != DetMode::Tile)
+            throw std::invalid_argument("--tile-size requires --det-mode tile");
+        if (det_mode == DetMode::Resize) det_size = 960;
+        if (det_size < 32 || det_size > 960 || det_size % 32 != 0)
+            throw std::invalid_argument("--tile-size must be a multiple of 32 from 32 through 960");
+        if (!task_trace && trace_path.empty())
+            throw std::invalid_argument("--trace-mode requires --trace");
+        if (!trace_raw_dir.empty() && !task_trace)
+            throw std::invalid_argument("--trace-raw-dir requires --trace-mode tasks");
+        if (rec_poll && rec_depth != 2)
+            throw std::invalid_argument("--rec-scheduling poll requires --rec-inflight 2");
 
         if (image_path.empty() && !from_clipboard) {
             std::cerr << "[-] Error: Please specify an image via --image <path> or use --clipboard.\n\n";
@@ -146,12 +246,20 @@ int main(int argc, char* argv[]) {
             std::cerr << "    Please run 'uv run python scripts/build_models.py' to generate the dictionary.\n";
         }
 
-        auto start_total = std::chrono::high_resolution_clock::now();
+        std::unique_ptr<ppocr::TraceRecorder> trace;
+        if (!trace_path.empty() || !trace_raw_dir.empty()) {
+            trace = std::make_unique<ppocr::TraceRecorder>();
+            trace->set_task_profiling_enabled(task_trace);
+            if (!trace_raw_dir.empty()) trace->set_raw_dump_directory(trace_raw_dir);
+            metrics.trace = trace.get();
+        }
+
+        auto start_total = ppocr::TraceRecorder::Clock::now();
 
         // 1. Image Acquisition via WIC
         ppocr::ImageBGR src_image;
         {
-            ppocr::ScopedTimer timer(metrics.image_decode_ms);
+            ppocr::ScopedTimer timer(metrics.image_decode_ms, metrics.trace, "Image decode");
             if (from_clipboard) {
                 std::cout << "[*] Reading image from Windows Clipboard...\n";
                 if (!ppocr::WicDecoder::decode_clipboard(src_image)) {
@@ -167,45 +275,102 @@ int main(int argc, char* argv[]) {
 
         // 2. Initialize NPU Level Zero Engine
         auto& engine = ppocr::NpuEngine::instance();
-        if (!engine.initialize()) {
-            std::cerr << "[-] NPU initialization failed.\n";
-            return 1;
+        {
+            const auto started = ppocr::TraceRecorder::Clock::now();
+            if (!engine.initialize()) {
+                std::cerr << "[-] NPU initialization failed.\n";
+                return 1;
+            }
+            const auto ended = ppocr::TraceRecorder::Clock::now();
+            metrics.engine_init_ms = std::chrono::duration<double, std::milli>(ended - started).count();
+            if (trace) trace->add_host_event("NPU runtime initialization", "Model Load", started, ended);
         }
+        engine.set_trace_recorder(trace.get());
         engine.set_ngraph_lite(use_lite);
         engine.set_manual_blob_cache(blob_cache);
-        engine.set_turbo(turbo);
+        engine.set_turbo(low_latency);
         if (metrics.enabled) engine.print_memory_usage("[baseline]");
+        if (cache_stats) engine.print_cache_usage("[baseline]");
 
         // 3. Load Models
-        constexpr std::array<int64_t, 4> kDet640Fill{1, 3, 640, 640};
-        constexpr std::array<int64_t, 4> kDet960Fill{1, 3, 960, 960};
+        const std::array<int64_t, 4> det_fill_dims{1, 3, det_size, det_size};
         constexpr std::array<int64_t, 4> kRec160Fill{1, 3, 48, 160};
         constexpr std::array<int64_t, 4> kRec320Fill{1, 3, 48, 320};
         constexpr std::array<int64_t, 4> kRec640Fill{1, 3, 48, 640};
 
+        auto load_profiled = [&](const char* label, const std::string& path, size_t requests,
+                                 std::span<const int64_t> fill, double& elapsed_total_ms) {
+            const auto start = ppocr::TraceRecorder::Clock::now();
+            auto graph = engine.load_model(path, requests, fill);
+            const auto end = ppocr::TraceRecorder::Clock::now();
+            const double elapsed = std::chrono::duration<double, std::milli>(end - start).count();
+            elapsed_total_ms += elapsed;
+            if (trace) trace->add_host_event(std::string(label) + " graph load", "Model Load", start, end);
+            if (metrics.enabled) {
+                const auto& stats = graph->load_stats();
+                std::cout << "[profile] " << label << " load=" << elapsed
+                          << " ms (graph_init=" << stats.graph_init_ms
+                          << ", profile_blob_export=" << stats.profiling_blob_export_ms
+                          << ", args=" << stats.argument_query_ms
+                          << ", request_pool=" << stats.request_pool_ms
+                          << ", requests=" << requests << ")\n";
+            }
+            return graph;
+        };
+        const std::span<const int64_t> det_fill(det_fill_dims);
         std::cout << "[*] Loading Detection model onto NPU: " << det_model << "..." << std::endl;
-        auto det_graph = engine.load_model(det_model, 2, det_960 ? kDet960Fill : kDet640Fill); // 2-deep tile pipeline (submit-ahead)
+        auto det_graph = load_profiled("det", det_model, 2, det_fill, metrics.det_model_load_ms); // 2-deep tile pipeline (submit-ahead)
+        const size_t det_input_bytes = static_cast<size_t>(det_size) * det_size * 3 * sizeof(uint16_t);
+        if (det_graph->inputs().empty() || det_graph->inputs()[0].total_bytes != det_input_bytes) {
+            throw std::runtime_error("Detection graph input does not match the selected " +
+                                     std::to_string(det_size) + "x" + std::to_string(det_size) +
+                                     " bucket; use a matching shape template or --tile-size");
+        }
         if (metrics.enabled) engine.print_memory_usage("[after det]");
+        if (cache_stats) engine.print_cache_usage("[after det]");
 
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
-        auto rec_graph_160 = fs::exists(rec_160) ? engine.load_model(rec_160, rec_depth, kRec160Fill) : nullptr;
+        auto rec_graph_160 = fs::exists(rec_160) ? load_profiled("rec160", rec_160, rec_depth, kRec160Fill, metrics.rec_model_load_ms) : nullptr;
         if (metrics.enabled) engine.print_memory_usage("[after rec160]");
-        auto rec_graph_320 = fs::exists(rec_320) ? engine.load_model(rec_320, rec_depth, kRec320Fill) : nullptr;
+        if (cache_stats) engine.print_cache_usage("[after rec160]");
+        auto rec_graph_320 = fs::exists(rec_320) ? load_profiled("rec320", rec_320, rec_depth, kRec320Fill, metrics.rec_model_load_ms) : nullptr;
         if (metrics.enabled) engine.print_memory_usage("[after rec320]");
-        auto rec_graph_640 = fs::exists(rec_640) ? engine.load_model(rec_640, rec_depth, kRec640Fill) : nullptr;
+        if (cache_stats) engine.print_cache_usage("[after rec320]");
+        auto rec_graph_640 = fs::exists(rec_640) ? load_profiled("rec640", rec_640, rec_depth, kRec640Fill, metrics.rec_model_load_ms) : nullptr;
         if (metrics.enabled) engine.print_memory_usage("[after rec640]");
+        if (cache_stats) engine.print_cache_usage("[after rec640]");
+        metrics.model_load_ms = metrics.det_model_load_ms + metrics.rec_model_load_ms;
 
+        auto validate_rec_shape = [](const std::shared_ptr<ppocr::NpuGraph>& graph, int width,
+                                     const char* label) {
+            if (!graph) return;
+            const std::vector<uint32_t> expected_dims{1, 3, 48, static_cast<uint32_t>(width)};
+            if (graph->inputs().empty() || graph->inputs()[0].dims != expected_dims) {
+                throw std::runtime_error(std::string(label) + " graph input does not match W=" +
+                                         std::to_string(width) +
+                                         "; use the Rec shape template or a matching static model");
+            }
+        };
+        validate_rec_shape(rec_graph_160, 160, "rec160");
+        validate_rec_shape(rec_graph_320, 320, "rec320");
+        validate_rec_shape(rec_graph_640, 640, "rec640");
+
+        const auto dict_load_start = ppocr::TraceRecorder::Clock::now();
         ppocr::CtcDecoder ctc_decoder(dict_path);
+        const auto dict_load_end = ppocr::TraceRecorder::Clock::now();
+        metrics.dict_load_ms = std::chrono::duration<double, std::milli>(dict_load_end - dict_load_start).count();
+        if (trace) trace->add_host_event("Dictionary load", "Model Load", dict_load_start, dict_load_end);
+        const auto post_load_start = ppocr::TraceRecorder::Clock::now();
 
         // 4. Detection Stage: Single-Tile or Multi-Tile Slicing
-        const int tile_size = 640;
-        bool need_slice = force_slice || (src_image.width > tile_size || src_image.height > tile_size);
+        const int tile_size = det_size;
+        const bool need_slice = src_image.width > tile_size || src_image.height > tile_size;
         ppocr::ProbHeatmap heatmap(src_image.width, src_image.height);
 
-        if (det_960) {
+        if (det_mode == DetMode::Resize) {
             if (det_graph->inputs().empty() ||
                 det_graph->inputs()[0].total_bytes != static_cast<size_t>(960) * 960 * 3 * 2) {
-                throw std::runtime_error("--det-960 requires a 960x960 det graph (use the shape template)");
+                throw std::runtime_error("960 resize mode requires a 960x960 det graph (use the shape template)");
             }
 
             int tw = src_image.width;
@@ -221,46 +386,57 @@ int main(int argc, char* argv[]) {
                 th = round32(static_cast<int>(src_image.height * ratio));
             }
 
-            ppocr::ImageBGR resized = ppocr::WicDecoder::resize_linear(src_image, tw, th);
-
-            ppocr::ImageBGR bucket;
-            bucket.width = 960;
-            bucket.height = 960;
-            bucket.channels = 3;
-            bucket.data.assign(static_cast<size_t>(960) * 960 * 3, 0);
-            for (int y = 0; y < th; ++y) {
-                std::memcpy(bucket.data.data() + static_cast<size_t>(y) * 960 * 3,
-                            resized.data.data() + static_cast<size_t>(y) * tw * 3,
-                            static_cast<size_t>(tw) * 3);
-            }
-
             metrics.det_tile_count = 1;
             auto& req = det_graph->get_request(0);
-            ppocr::WicDecoder::normalize_to_nchw_fp16(bucket, req.get_input_ptr(0));
             {
-                ppocr::ScopedTimer timer(metrics.det_inference_ms);
+                ppocr::ScopedTimer timer(metrics.det_preprocess_ms, metrics.trace, "Det preprocess");
+                ppocr::ImageBGR resized = ppocr::WicDecoder::resize_linear(src_image, tw, th);
+
+                ppocr::ImageBGR bucket;
+                bucket.width = 960;
+                bucket.height = 960;
+                bucket.channels = 3;
+                bucket.data.assign(static_cast<size_t>(960) * 960 * 3, 0);
+                for (int y = 0; y < th; ++y) {
+                    std::memcpy(bucket.data.data() + static_cast<size_t>(y) * 960 * 3,
+                                resized.data.data() + static_cast<size_t>(y) * tw * 3,
+                                static_cast<size_t>(tw) * 3);
+                }
+                ppocr::WicDecoder::normalize_to_nchw_fp16(bucket, req.get_input_ptr(0));
+            }
+            {
+                ppocr::ScopedTimer timer(metrics.det_inference_ms, metrics.trace, "Det host submit + wait");
                 req.start_async();
                 req.wait();
             }
 
-            const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
-            ppocr::ProbHeatmap full(960, 960);
-            for (int p = 0; p < 960 * 960; ++p) {
-                full.data()[p] = ppocr::fp16_to_float(p_out_fp16[p]);
+            {
+                ppocr::ScopedTimer timer(metrics.det_output_decode_ms, metrics.trace, "Det output decode/copy");
+                const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+                ppocr::ProbHeatmap full(960, 960);
+                for (int p = 0; p < 960 * 960; ++p) {
+                    full.data()[p] = ppocr::fp16_to_float(p_out_fp16[p]);
+                }
+
+                heatmap = ppocr::ProbHeatmap(tw, th);
+                for (int y = 0; y < th; ++y) {
+                    std::memcpy(heatmap.data().data() + static_cast<size_t>(y) * tw,
+                                full.data().data() + static_cast<size_t>(y) * 960,
+                                static_cast<size_t>(tw) * sizeof(float));
+                }
+                if (!det_heatmap_dir.empty()) {
+                    const fs::path tile_path = fs::path(det_heatmap_dir) / "det-tile-00-x0000-y0000.pgm";
+                    if (!save_probability_pgm(full.data().data(), full.width(), full.height(), tile_path)) {
+                        throw std::runtime_error("failed to save detector tile heatmap: " + tile_path.string());
+                    }
+                }
             }
 
-            heatmap = ppocr::ProbHeatmap(tw, th);
-            for (int y = 0; y < th; ++y) {
-                std::memcpy(heatmap.data().data() + static_cast<size_t>(y) * tw,
-                            full.data().data() + static_cast<size_t>(y) * 960,
-                            static_cast<size_t>(tw) * sizeof(float));
-            }
-
-            std::cout << "[*] --det-960: " << src_image.width << "x" << src_image.height
+            std::cout << "[*] Detection resize: " << src_image.width << "x" << src_image.height
                       << " -> " << tw << "x" << th << " (padded to 960x960)\n";
         } else if (need_slice) {
-            // Uniformly distributed tiling with guaranteed min_overlap=80
-            const int min_overlap = 80;
+            // Preserve a positive stride for small experimental tile buckets.
+            const int min_overlap = std::min(80, tile_size / 2);
             const int eff_step = tile_size - min_overlap;
 
             int nx = (src_image.width <= tile_size) ? 1 : static_cast<int>(std::ceil(static_cast<float>(src_image.width - min_overlap) / eff_step));
@@ -271,7 +447,8 @@ int main(int argc, char* argv[]) {
             float step_y = (ny > 1) ? static_cast<float>(src_image.height - tile_size) / (ny - 1) : 0.0f;
 
             std::cout << "[*] Large image detected. Dispatching tiled NPU detection: "
-                      << nx << "x" << ny << " = " << metrics.det_tile_count << " tiles (640x640, uniform step)...\n";
+                      << nx << "x" << ny << " = " << metrics.det_tile_count << " tiles ("
+                      << tile_size << "x" << tile_size << ", uniform step)...\n";
 
             struct TileTask {
                 int x, y;
@@ -280,7 +457,7 @@ int main(int argc, char* argv[]) {
 
             std::vector<TileTask> tasks;
             {
-                ppocr::ScopedTimer timer(metrics.tile_prep_ms);
+                ppocr::ScopedTimer timer(metrics.tile_prep_ms, metrics.trace, "Det tile preparation");
                 for (int iy = 0; iy < ny; ++iy) {
                     int ty = (ny > 1) ? static_cast<int>(std::round(iy * step_y)) : 0;
                     for (int ix = 0; ix < nx; ++ix) {
@@ -293,19 +470,26 @@ int main(int argc, char* argv[]) {
             // Two-slot tile pipeline: keep submitting ahead while each slot is
             // awaited only on its own queue (device execution itself is serial)
             std::vector<std::vector<float>> tile_outputs(tasks.size(), std::vector<float>(tile_size * tile_size));
+            metrics.det_submission_wall_includes_components = true;
             {
-                ppocr::ScopedTimer timer(metrics.det_inference_ms);
+                ppocr::ScopedTimer timer(metrics.det_inference_ms, metrics.trace, "Det submission pipeline",
+                                         "Host", 2002);
                 for (size_t i = 0; i < tasks.size(); ++i) {
                     auto& req = det_graph->get_request(i % 2);
                     if (i >= 2) {
                         req.wait();
-                        const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
-                        for (int p = 0; p < tile_size * tile_size; ++p) {
-                            tile_outputs[i - 2][p] = ppocr::fp16_to_float(p_out_fp16[p]);
+                        {
+                            ppocr::ScopedTimer timer(metrics.det_output_decode_ms, metrics.trace, "Det output decode/copy");
+                            const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+                            for (int p = 0; p < tile_size * tile_size; ++p)
+                                tile_outputs[i - 2][p] = ppocr::fp16_to_float(p_out_fp16[p]);
                         }
                     }
 
-                    ppocr::WicDecoder::normalize_to_nchw_fp16(tasks[i].tile_img, req.get_input_ptr(0));
+                    {
+                        ppocr::ScopedTimer timer(metrics.det_preprocess_ms, metrics.trace, "Det preprocess");
+                        ppocr::WicDecoder::normalize_to_nchw_fp16(tasks[i].tile_img, req.get_input_ptr(0));
+                    }
                     req.start_async();
                 }
 
@@ -315,9 +499,11 @@ int main(int argc, char* argv[]) {
                         if (slot < tasks.size()) {
                             auto& req = det_graph->get_request(slot % 2);
                             req.wait();
-                            const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
-                            for (int p = 0; p < tile_size * tile_size; ++p) {
-                                tile_outputs[slot][p] = ppocr::fp16_to_float(p_out_fp16[p]);
+                            {
+                            ppocr::ScopedTimer timer(metrics.det_output_decode_ms, metrics.trace, "Det output decode/copy");
+                                const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+                                for (int p = 0; p < tile_size * tile_size; ++p)
+                                    tile_outputs[slot][p] = ppocr::fp16_to_float(p_out_fp16[p]);
                             }
                         }
                     }
@@ -325,6 +511,17 @@ int main(int argc, char* argv[]) {
             }
 
             // Element-wise Max Stitching
+            if (!det_heatmap_dir.empty()) {
+                for (size_t i = 0; i < tasks.size(); ++i) {
+                    const auto& task = tasks[i];
+                    const fs::path tile_path = fs::path(det_heatmap_dir) /
+                        ("det-tile-" + std::to_string(i) + "-x" + std::to_string(task.x) +
+                         "-y" + std::to_string(task.y) + ".pgm");
+                    if (!save_probability_pgm(tile_outputs[i].data(), tile_size, tile_size, tile_path)) {
+                        throw std::runtime_error("failed to save detector tile heatmap: " + tile_path.string());
+                    }
+                }
+            }
             for (size_t i = 0; i < tasks.size(); ++i) {
                 heatmap.stitch_tile_max(tile_outputs[i].data(), tile_size, tile_size, tasks[i].x, tasks[i].y);
             }
@@ -333,23 +530,34 @@ int main(int argc, char* argv[]) {
             metrics.det_tile_count = 1;
             ppocr::ImageBGR single_tile;
             {
-                ppocr::ScopedTimer timer(metrics.tile_prep_ms);
+                ppocr::ScopedTimer timer(metrics.tile_prep_ms, metrics.trace, "Det tile preparation");
                 single_tile = ppocr::WicDecoder::extract_tile(src_image, 0, 0, tile_size, tile_size);
             }
 
             auto& req = det_graph->get_request(0);
-            ppocr::WicDecoder::normalize_to_nchw_fp16(single_tile, req.get_input_ptr(0));
+            {
+                ppocr::ScopedTimer timer(metrics.det_preprocess_ms, metrics.trace, "Det preprocess");
+                ppocr::WicDecoder::normalize_to_nchw_fp16(single_tile, req.get_input_ptr(0));
+            }
 
             {
-                ppocr::ScopedTimer timer(metrics.det_inference_ms);
+                ppocr::ScopedTimer timer(metrics.det_inference_ms, metrics.trace, "Det host submit + wait");
                 req.start_async();
                 req.wait();
             }
 
-            const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
             std::vector<float> single_prob(tile_size * tile_size);
-            for (int p = 0; p < tile_size * tile_size; ++p) {
-                single_prob[p] = ppocr::fp16_to_float(p_out_fp16[p]);
+            {
+                ppocr::ScopedTimer timer(metrics.det_output_decode_ms, metrics.trace, "Det output decode/copy");
+                const uint16_t* p_out_fp16 = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+                for (int p = 0; p < tile_size * tile_size; ++p)
+                    single_prob[p] = ppocr::fp16_to_float(p_out_fp16[p]);
+            }
+            if (!det_heatmap_dir.empty()) {
+                const fs::path tile_path = fs::path(det_heatmap_dir) / "det-tile-00-x0000-y0000.pgm";
+                if (!save_probability_pgm(single_prob.data(), tile_size, tile_size, tile_path)) {
+                    throw std::runtime_error("failed to save detector tile heatmap: " + tile_path.string());
+                }
             }
             heatmap.stitch_tile_max(single_prob.data(), tile_size, tile_size, 0, 0);
         }
@@ -358,11 +566,20 @@ int main(int argc, char* argv[]) {
         ppocr::DbNetPostProcessor post_proc(0.2f, 0.45f, 1.4f);
         std::vector<ppocr::TextBox> boxes;
         {
-            ppocr::ScopedTimer timer(metrics.dbnet_postprocess_ms);
+            ppocr::ScopedTimer timer(metrics.dbnet_postprocess_ms, metrics.trace, "DBNet postprocess");
             boxes = post_proc.extract_boxes(heatmap, src_image.width, src_image.height);
         }
         metrics.detected_box_count = static_cast<int>(boxes.size());
         std::cout << "[+] Text Detection complete: found " << boxes.size() << " text lines.\n";
+        if (!det_heatmap_dir.empty()) {
+            fs::create_directories(det_heatmap_dir);
+            const fs::path output = fs::path(det_heatmap_dir) / "detector-heatmap.pgm";
+            if (!save_heatmap_pgm(heatmap, output)) {
+                throw std::runtime_error("failed to save detector heatmap: " + output.string());
+            }
+            std::cout << "[*] Detector heatmap saved: " << output.string()
+                      << " (" << heatmap.width() << "x" << heatmap.height() << ")\n";
+        }
 
         // TODO(CLS): this pipeline has no text-line orientation classification (0/180).
         // Upside-down lines (scans, rotated screenshots) are fed to rec as-is and CTC
@@ -379,6 +596,8 @@ int main(int argc, char* argv[]) {
             if (!rec_graph_160 && !rec_graph_320 && !rec_graph_640) {
                 std::cerr << "[-] Notice: No recognition models found. Detection boxes output only.\n";
             } else {
+                ppocr::ScopedTimer rec_pipeline_timer(
+                    metrics.rec_pipeline_wall_ms, metrics.trace, "Recognition pipeline wall", "Host", 2003);
                 std::cout << "[*] Executing Recognition on NPU across Multi-Bucket Grid Pipeline...\n";
 
                 // Recognition pipeline: submit box b, prepare b+1, decode b-2. Each
@@ -398,7 +617,7 @@ int main(int argc, char* argv[]) {
                     PendingRec& p = pending[slot];
                     const uint16_t* p_out = reinterpret_cast<const uint16_t*>(p.req->get_output_ptr(0));
                     {
-                        ppocr::ScopedTimer timer(metrics.ctc_decode_ms);
+                        ppocr::ScopedTimer timer(metrics.ctc_decode_ms, metrics.trace, "CTC decode");
                         p.box->text = ctc_decoder.decode(p_out, p.valid_seq_len, p.vocab_size, p.box->text_confidence);
                     }
                     p.req = nullptr;
@@ -408,7 +627,7 @@ int main(int argc, char* argv[]) {
                     PendingRec& p = pending[slot];
                     if (!p.req) return;
                     {
-                        ppocr::ScopedTimer timer(metrics.rec_inference_ms);
+                        ppocr::ScopedTimer timer(metrics.rec_wait_ms, metrics.trace, "Rec fence wait");
                         p.req->wait();
                     }
                     consume_rec_slot(slot);
@@ -419,7 +638,7 @@ int main(int argc, char* argv[]) {
                     // Crop quad normalized to height 48, with natural uncompressed width
                     ppocr::ImageBGR natural_crop;
                     {
-                        ppocr::ScopedTimer timer(metrics.rec_crop_prep_ms);
+                        ppocr::ScopedTimer timer(metrics.rec_crop_prep_ms, metrics.trace, "Text crop and warp");
                         natural_crop = ppocr::WicDecoder::crop_quad_natural(src_image, box.quad, 48);
                     }
 
@@ -448,26 +667,35 @@ int main(int argc, char* argv[]) {
                         padded_crop.data.assign(target_w * 48 * 3, 0);
 
                         int valid_w = std::min(target_w, natural_w);
-                        for (int y = 0; y < 48; ++y) {
-                            std::memcpy(
-                                padded_crop.data.data() + (y * target_w) * 3,
-                                natural_crop.data.data() + (y * natural_w) * 3,
-                                valid_w * 3
-                            );
+                        {
+                            ppocr::ScopedTimer timer(metrics.rec_padding_ms, metrics.trace, "Rec padding/copy");
+                            for (int y = 0; y < 48; ++y) {
+                                std::memcpy(
+                                    padded_crop.data.data() + (y * target_w) * 3,
+                                    natural_crop.data.data() + (y * natural_w) * 3,
+                                    valid_w * 3
+                                );
+                            }
                         }
 
                         // Default: reuse slot b%depth only after its previous submission
                         // (box b-depth) is done; the other slots' requests are untouched.
-                        // --rec-poll (depth 2 only): consume whichever slot finished
+                        // Poll mode (depth 2 only): consume whichever slot finished.
                         // first, then reuse that slot.
                         size_t slot = b % static_cast<size_t>(rec_depth);
                         if (rec_poll && rec_depth == 2) {
                             if (pending[0].req && pending[1].req) {
-                                for (;;) {
-                                    if (pending[0].req->try_wait()) { consume_rec_slot(0); slot = 0; break; }
-                                    if (pending[1].req->try_wait()) { consume_rec_slot(1); slot = 1; break; }
-                                    Sleep(0);
+                                size_t completed_slot = pending.size();
+                                {
+                                    ppocr::ScopedTimer timer(metrics.rec_wait_ms, metrics.trace, "Rec poll wait");
+                                    for (;;) {
+                                        if (pending[0].req->try_wait()) { completed_slot = 0; break; }
+                                        if (pending[1].req->try_wait()) { completed_slot = 1; break; }
+                                        Sleep(0);
+                                    }
                                 }
+                                slot = completed_slot;
+                                consume_rec_slot(completed_slot);
                             } else {
                                 slot = pending[0].req ? 1 : 0;
                             }
@@ -476,13 +704,16 @@ int main(int argc, char* argv[]) {
                         }
 
                         auto& req = target_graph->get_request(slot);
-                        ppocr::WicDecoder::normalize_to_nchw_fp16(
-                            padded_crop, req.get_input_ptr(0),
-                            127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
-                        );
+                        {
+                            ppocr::ScopedTimer timer(metrics.rec_preprocess_ms, metrics.trace, "Rec preprocess");
+                            ppocr::WicDecoder::normalize_to_nchw_fp16(
+                                padded_crop, req.get_input_ptr(0),
+                                127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
+                            );
+                        }
 
                         {
-                            ppocr::ScopedTimer timer(metrics.rec_inference_ms);
+                            ppocr::ScopedTimer timer(metrics.rec_submit_ms, metrics.trace, "Rec host submit");
                             req.start_async();
                         }
 
@@ -520,28 +751,37 @@ int main(int argc, char* argv[]) {
                             int valid_slice_w = std::min(win_w, natural_w - sx);
 
                             ppocr::ImageBGR slice_img;
-                            slice_img.width = win_w;
-                            slice_img.height = 48;
-                            slice_img.channels = 3;
-                            slice_img.data.assign(win_w * 48 * 3, 0);
+                            {
+                                ppocr::ScopedTimer timer(metrics.rec_padding_ms, metrics.trace, "Rec padding/copy");
+                                slice_img.width = win_w;
+                                slice_img.height = 48;
+                                slice_img.channels = 3;
+                                slice_img.data.assign(win_w * 48 * 3, 0);
 
-                            for (int y = 0; y < 48; ++y) {
-                                std::memcpy(
-                                    slice_img.data.data() + (y * win_w) * 3,
-                                    natural_crop.data.data() + (y * natural_w + sx) * 3,
-                                    valid_slice_w * 3
-                                );
+                                for (int y = 0; y < 48; ++y) {
+                                    std::memcpy(
+                                        slice_img.data.data() + (y * win_w) * 3,
+                                        natural_crop.data.data() + (y * natural_w + sx) * 3,
+                                        valid_slice_w * 3
+                                    );
+                                }
                             }
 
                             auto& req = target_graph->get_request(s % 2);
-                            ppocr::WicDecoder::normalize_to_nchw_fp16(
-                                slice_img, req.get_input_ptr(0),
-                                127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
-                            );
+                            {
+                                ppocr::ScopedTimer timer(metrics.rec_preprocess_ms, metrics.trace, "Rec preprocess");
+                                ppocr::WicDecoder::normalize_to_nchw_fp16(
+                                    slice_img, req.get_input_ptr(0),
+                                    127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
+                                );
+                            }
 
                             {
-                                ppocr::ScopedTimer timer(metrics.rec_inference_ms);
-                                req.start_async();
+                                {
+                                    ppocr::ScopedTimer timer(metrics.rec_submit_ms, metrics.trace, "Rec host submit");
+                                    req.start_async();
+                                }
+                                ppocr::ScopedTimer timer(metrics.rec_wait_ms, metrics.trace, "Rec fence wait");
                                 req.wait();
                             }
 
@@ -570,7 +810,7 @@ int main(int argc, char* argv[]) {
                         // Run single CTC decode on the merged Logits
                         int total_seq_len = static_cast<int>(merged_logits.size() / vocab_size);
                         {
-                            ppocr::ScopedTimer timer(metrics.ctc_decode_ms);
+                            ppocr::ScopedTimer timer(metrics.ctc_decode_ms, metrics.trace, "CTC decode");
                             box.text = ctc_decoder.decode(merged_logits.data(), total_seq_len, vocab_size, box.text_confidence);
                         }
                     }
@@ -592,8 +832,14 @@ int main(int argc, char* argv[]) {
         }
         boxes = std::move(valid_boxes);
 
-        auto end_total = std::chrono::high_resolution_clock::now();
+        auto end_total = ppocr::TraceRecorder::Clock::now();
         metrics.total_end_to_end_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+        metrics.post_load_pipeline_ms = std::chrono::duration<double, std::milli>(
+            end_total - post_load_start).count();
+        if (trace) {
+            trace->add_host_event("Post-load OCR pipeline", "Pipeline", post_load_start, end_total, 2000);
+            trace->add_host_event("End-to-end", "Pipeline", start_total, end_total, 2001);
+        }
 
         // 7. Formatted Terminal Output
         std::cout << "\n============================================================\n";
@@ -611,6 +857,20 @@ int main(int argc, char* argv[]) {
 
         // 8. Output Detailed Profile if Requested
         metrics.print_report();
+        if (trace) {
+            const size_t traced_requests = trace->collect_pending_profiles();
+            if (!trace_path.empty()) {
+                std::string error;
+                if (!trace->write_chrome_trace(trace_path, error)) {
+                    throw std::runtime_error("Failed to export trace to '" + trace_path + "': " + error);
+                }
+                std::cout << "[+] NPU/host trace exported: " << trace_path
+                          << " (" << traced_requests << " requests)\n";
+            }
+            if (!trace_raw_dir.empty()) {
+                std::cout << "[+] Raw NPU profile buffers and graph blobs exported to: " << trace_raw_dir << "\n";
+            }
+        }
 
     } catch (const std::exception& ex) {
         std::cerr << "[-] Error: " << ex.what() << "\n";

@@ -7,7 +7,7 @@ standalone NGRAPH_LITE packages, and pre-compiled Level Zero Blobs.
 
 Applies the following optimizations:
 - Detection (Det):
-    - Sets native 640x640 resolution (eliminating 22.5MB scratchpad bloat vs 736x736, +27% speedup)
+    - Builds the default 960x960 detection graph; 640x640 remains available for fixed-size tiling
     - Pure FP16 port unification (ConvertFP32ToFP16)
 - Recognition (Rec):
     - Multi-bucket static shapes: W=160 (short words), W=320 (standard sentences), W=640 (long sentences)
@@ -90,7 +90,28 @@ def make_shape_template(src_xml: Path, dst_xml: Path, template_dims: list):
     print(f"  [+] Shape template: {dst_xml.name} ({dst_xml.stat().st_size / 1024:.1f} KB, bin reused)")
 
 
-def optimize_det_model(onnx_path: Path, output_dir: Path, size: int = 640) -> tuple[Path, Path]:
+def optimize_det_activations(model):
+    nodes = {node.get_friendly_name(): node for node in model.get_ordered_ops()}
+    terminal = nodes.get("Mul.7")
+    if terminal is None or terminal.get_type_name() != "Multiply":
+        raise RuntimeError("Expected Det activation node Mul.7 was not found")
+
+    gelu_product = terminal.input_value(0).get_node()
+    if gelu_product.get_type_name() != "Multiply":
+        raise RuntimeError("Unexpected Det Mul.7 GELU graph")
+    activation_input = gelu_product.input_value(0).get_node()
+    if activation_input.get_friendly_name() != "Conv.11" or activation_input.get_output_shape(0) != [1, 96, 160, 160]:
+        raise RuntimeError("Mul.7 GELU shape/producer changed; refusing the validated activation rewrite")
+
+    # This 96x160x160 GELU was the largest repeated SHAVE hotspot; the PPE-fusible
+    # ReLU passed all 50 local Det validation samples and reduced NPU latency.
+    relu = ov.opset13.relu(activation_input)
+    relu.set_friendly_name("Mul.7")
+    ov.utils.replace_node(terminal, relu)
+
+
+def optimize_det_model(onnx_path: Path, output_dir: Path, size: int = 640,
+                       replace_mul7_relu: bool = False) -> tuple[Path, Path]:
     """Builds optimized Det model at static resolution."""
     print(f"\n[1/3] Building Optimized Det Model (Size: {size}x{size})...")
     core = ov.Core()
@@ -101,6 +122,11 @@ def optimize_det_model(onnx_path: Path, output_dir: Path, size: int = 640) -> tu
     pm = passes.Manager()
     pm.register_pass(passes.ConvertFP32ToFP16())
     pm.run_passes(model)
+    # GELU->ReLU changes model semantics, so the measured candidate stays opt-in.
+    if replace_mul7_relu:
+        if size != 640:
+            raise ValueError("--det-relu-mul7 is validated only for a 640x640 Det graph")
+        optimize_det_activations(model)
 
     xml_path = output_dir / f"ppocrv6_small_det_{size}x{size}.xml"
     bin_path = output_dir / f"ppocrv6_small_det_{size}x{size}.bin"
@@ -167,7 +193,10 @@ def main():
     parser.add_argument("--det-onnx", type=Path, default=Path(r"D:\TEMP\npu-experiments\models\PPOCR_v6_baidu_bos\models\PP-OCRv6_small_det_onnx_infer\inference.onnx"), help="Path to original Small Det ONNX")
     parser.add_argument("--rec-onnx", type=Path, default=Path(r"D:\TEMP\npu-experiments\models\PPOCR_v6_baidu_bos\models\PP-OCRv6_small_rec_onnx_infer\inference.onnx"), help="Path to original Small Rec ONNX")
     parser.add_argument("--output-dir", type=Path, default=Path("models"), help="Output directory for optimized models")
-    parser.add_argument("--det-size", type=int, default=640, help="Detection resolution (default 640 for optimal performance)")
+    parser.add_argument("--det-size", type=int, default=960,
+                        help="Detection resolution (default 960 for the default whole-image resize path)")
+    parser.add_argument("--det-relu-mul7", action="store_true",
+                        help="Opt in to the validated but non-equivalent Mul.7 GELU->ReLU rewrite (640x640 only)")
     parser.add_argument("--rec-widths", nargs="+", type=int, default=[160, 320, 640], help="Recognition width buckets")
     parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries for NPU")
     parser.add_argument("--no-templates", action="store_true", help="Skip shape template generation (.xml/.bin/.ngraph_lite)")
@@ -193,7 +222,8 @@ def main():
     print("==============================================================")
 
     # 1. Optimize Det Model
-    det_xml, _ = optimize_det_model(args.det_onnx, args.output_dir, size=args.det_size)
+    det_xml, _ = optimize_det_model(args.det_onnx, args.output_dir, size=args.det_size,
+                                    replace_mul7_relu=args.det_relu_mul7)
     if args.compile_blobs:
         det_blob = args.output_dir / f"ppocrv6_small_det_{args.det_size}x{args.det_size}.blob"
         compile_npu_blob(det_xml, det_blob)

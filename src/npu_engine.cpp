@@ -4,7 +4,9 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +20,32 @@
 namespace fs = std::filesystem;
 
 namespace ppocr {
+
+// Optional compiler flags are kept out of the normal path; experiments can
+// pass the exact Level Zero build-flag string without changing model assets.
+std::string compiler_build_flags() {
+    char* value = nullptr;
+    size_t value_size = 0;
+    const errno_t env_result = _dupenv_s(&value, &value_size, "PPOCR_NPU_COMPILER_FLAGS");
+    if (env_result == 0 && value != nullptr) {
+        std::string flags(value);
+        std::free(value);
+        return flags;
+    }
+    std::free(value);
+
+    // NPU37XX can optimize dependencies across DMA, SHAVE, and DPU queues in
+    // FWLM mode. Keep this as the default graph build mode because the device
+    // measurement shows a shorter W=5 command window; the environment override
+    // remains available for compiler experiments and compatibility fallback.
+    return "--config NPU_COMPILATION_MODE_PARAMS=\"workload-management-mode=FWLM_V1_PAGES\"";
+}
+
+uint64_t steady_ns_midpoint(TraceRecorder::TimePoint before, TraceRecorder::TimePoint after) {
+    const auto midpoint = before + (after - before) / 2;
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        midpoint.time_since_epoch()).count());
+}
 
 // Read-only mapping of a NATIVE blob file. Used only while the graph is being
 // created/initialized: the driver copies the blob at init, after which the
@@ -217,8 +245,20 @@ std::string fill_tag(std::span<const int64_t> fill) {
     return tag;
 }
 
+std::string compiler_flags_cache_tag() {
+    constexpr uint64_t offset_basis = 14695981039346656037ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offset_basis;
+    for (unsigned char value : compiler_build_flags()) {
+        hash ^= value;
+        hash *= prime;
+    }
+    return std::to_string(hash);
+}
+
 fs::path manual_cache_blob(const std::string& stem, std::span<const int64_t> fill) {
-    return fs::path("cache") / "lite" / (stem + "_" + fill_tag(fill) + ".blob");
+    return fs::path("cache") / "lite" /
+           (stem + "_" + fill_tag(fill) + "_cfg" + compiler_flags_cache_tag() + ".blob");
 }
 
 bool cache_newer_than(const fs::path& blob, std::initializer_list<fs::path> sources) {
@@ -245,9 +285,15 @@ NpuInferRequest::NpuInferRequest(
     ze_graph_handle_t graph,
     const std::vector<TensorDesc>& inputs,
     const std::vector<TensorDesc>& outputs,
-    ze_graph_dditable_ext_t* graph_api
+    ze_graph_dditable_ext_t* graph_api,
+    ze_graph_profiling_dditable_ext_t* profiling_api,
+    TraceRecorder* trace,
+    std::string graph_name,
+    size_t request_index
 ) : context_(context), device_(device), queue_(slot->queue), graph_(graph),
-    graph_api_(graph_api), input_descs_(inputs), output_descs_(outputs), fence_(slot->fence)
+    graph_api_(graph_api), profiling_api_(profiling_api), trace_(trace),
+    graph_name_(std::move(graph_name)), request_index_(request_index),
+    input_descs_(inputs), output_descs_(outputs), fence_(slot->fence)
 {
     // Queue and fence are borrowed from the engine pool. Waits only drain this
     // request's submission, which lets the host overlap crop/normalize/CTC with
@@ -273,6 +319,17 @@ NpuInferRequest::NpuInferRequest(
         output_ptrs_.push_back(ptr);
     }
 
+    if (trace_) {
+        void* before = nullptr;
+        void* after = nullptr;
+        check_ze(zeMemAllocShared(context_, &dev_desc, &host_desc, sizeof(uint64_t), 8, device_, &before),
+                 "Alloc timestamp-before buffer");
+        check_ze(zeMemAllocShared(context_, &dev_desc, &host_desc, sizeof(uint64_t), 8, device_, &after),
+                 "Alloc timestamp-after buffer");
+        command_timestamp_before_ = static_cast<uint64_t*>(before);
+        command_timestamp_after_ = static_cast<uint64_t*>(after);
+    }
+
     // Create Command List
     ze_command_list_desc_t cmd_desc{};
     cmd_desc.stype = ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC;
@@ -290,13 +347,42 @@ NpuInferRequest::NpuInferRequest(
 }
 
 NpuInferRequest::~NpuInferRequest() {
+    destroy_profile_query();
     if (command_list_) zeCommandListDestroy(command_list_);
 
     for (void* p : input_ptrs_) if (p) zeMemFree(context_, p);
     for (void* p : output_ptrs_) if (p) zeMemFree(context_, p);
+    if (command_timestamp_before_) zeMemFree(context_, command_timestamp_before_);
+    if (command_timestamp_after_) zeMemFree(context_, command_timestamp_after_);
 }
 
 void NpuInferRequest::start_async() {
+    submit_start_ = TraceRecorder::Clock::now();
+    if (trace_) {
+        const auto sample_start = TraceRecorder::Clock::now();
+        uint64_t host_ns = 0, device_ticks = 0;
+        if (zeDeviceGetGlobalTimestamps(device_, &host_ns, &device_ticks) == ZE_RESULT_SUCCESS) {
+            const auto sample_end = TraceRecorder::Clock::now();
+            trace_->add_global_timestamp_sample_with_steady(
+                graph_name_ + " request " + std::to_string(request_index_) + " before-submit", host_ns,
+                steady_ns_midpoint(sample_start, sample_end), device_ticks);
+        }
+    }
+    if (trace_ && profiling_api_) {
+        const auto profile_setup_start = TraceRecorder::Clock::now();
+        ze_result_t result = profiling_api_->pfnProfilingPoolCreate(graph_, 1, &profiling_pool_);
+        if (result == ZE_RESULT_SUCCESS) {
+            result = profiling_api_->pfnProfilingQueryCreate(profiling_pool_, 0, &profiling_query_);
+        }
+        if (result != ZE_RESULT_SUCCESS) {
+            std::cerr << "[!] NPU trace profiling query creation failed (0x" << std::hex << result
+                      << std::dec << "); exporting host timings only.\n";
+            destroy_profile_query();
+        }
+        trace_->add_host_event("Create one-shot profiling query", "Profiler Overhead",
+                               profile_setup_start, TraceRecorder::Clock::now(), 8);
+    }
+
     check_ze(zeCommandListReset(command_list_), "CommandListReset");
 
     // Bind arguments before execution
@@ -308,24 +394,98 @@ void NpuInferRequest::start_async() {
         check_ze(graph_api_->pfnSetArgumentValue(graph_, arg_idx++, p), "SetArgOut");
     }
 
-    check_ze(graph_api_->pfnAppendGraphExecute(command_list_, graph_, nullptr, nullptr, 0, nullptr), "AppendGraphExecute");
+    if (command_timestamp_before_ && command_timestamp_after_) {
+        *command_timestamp_before_ = 0;
+        *command_timestamp_after_ = 0;
+        command_before_tick_ = 0;
+        command_after_tick_ = 0;
+        check_ze(zeCommandListAppendWriteGlobalTimestamp(
+                     command_list_, command_timestamp_before_, nullptr, 0, nullptr),
+                 "Append timestamp-before");
+    }
+    check_ze(graph_api_->pfnAppendGraphExecute(command_list_, graph_, profiling_query_, nullptr, 0, nullptr), "AppendGraphExecute");
+    if (command_timestamp_before_ && command_timestamp_after_) {
+        check_ze(zeCommandListAppendWriteGlobalTimestamp(
+                     command_list_, command_timestamp_after_, nullptr, 0, nullptr),
+                 "Append timestamp-after");
+    }
     check_ze(zeCommandListClose(command_list_), "CommandListClose");
     check_ze(zeFenceReset(fence_), "FenceReset");
     check_ze(zeCommandQueueExecuteCommandLists(queue_, 1, &command_list_, fence_), "ExecuteCommandLists");
+    submit_end_ = TraceRecorder::Clock::now();
+    in_flight_ = true;
 }
 
 // Synchronizes this request's pooled fence, so only this request's submission
 // is awaited (requests with other pool indices are unaffected).
 void NpuInferRequest::wait() {
+    const auto wait_start = TraceRecorder::Clock::now();
     check_ze(zeFenceHostSynchronize(fence_, UINT64_MAX), "FenceHostSynchronize");
+    const auto completion = TraceRecorder::Clock::now();
+    record_command_timestamps();
+    if (trace_) {
+        const auto sample_start = TraceRecorder::Clock::now();
+        uint64_t host_ns = 0, device_ticks = 0;
+        if (zeDeviceGetGlobalTimestamps(device_, &host_ns, &device_ticks) == ZE_RESULT_SUCCESS) {
+            const auto sample_end = TraceRecorder::Clock::now();
+            trace_->add_global_timestamp_sample_with_steady(
+                graph_name_ + " request " + std::to_string(request_index_) + " after-fence", host_ns,
+                steady_ns_midpoint(sample_start, sample_end), device_ticks);
+        }
+    }
+    if (trace_ && in_flight_) {
+        trace_->add_host_event(graph_name_ + " fence wait", "Host Wait", wait_start, completion, 2);
+        collect_profile(completion);
+    }
 }
 
 bool NpuInferRequest::try_wait() {
     ze_result_t result = zeFenceQueryStatus(fence_);
-    if (result == ZE_RESULT_SUCCESS) return true;
+    if (result == ZE_RESULT_SUCCESS) {
+        if (trace_ && in_flight_) {
+            record_command_timestamps();
+            collect_profile(TraceRecorder::Clock::now());
+        }
+        return true;
+    }
     if (result == ZE_RESULT_NOT_READY) return false;
     check_ze(result, "FenceQueryStatus");
     return false;
+}
+
+void NpuInferRequest::destroy_profile_query() {
+    if (profiling_query_ && profiling_api_ && profiling_api_->pfnProfilingQueryDestroy) {
+        profiling_api_->pfnProfilingQueryDestroy(profiling_query_);
+        profiling_query_ = nullptr;
+    }
+    if (profiling_pool_ && profiling_api_ && profiling_api_->pfnProfilingPoolDestroy) {
+        profiling_api_->pfnProfilingPoolDestroy(profiling_pool_);
+        profiling_pool_ = nullptr;
+    }
+}
+
+void NpuInferRequest::collect_profile(TraceRecorder::TimePoint completion) {
+    if (trace_) {
+        trace_->add_pending_profile(profiling_api_, profiling_pool_, profiling_query_,
+                                    graph_name_ + " request " + std::to_string(request_index_),
+                                    submit_start_, submit_end_, completion,
+                                    command_before_tick_, command_after_tick_);
+        profiling_pool_ = nullptr;
+        profiling_query_ = nullptr;
+    }
+    in_flight_ = false;
+}
+
+void NpuInferRequest::record_command_timestamps() {
+    if (!trace_ || !command_timestamp_before_ || !command_timestamp_after_) return;
+    command_before_tick_ = *command_timestamp_before_;
+    command_after_tick_ = *command_timestamp_after_;
+    trace_->add_command_timestamp_sample(
+        graph_name_ + " request " + std::to_string(request_index_) + " command-before",
+        *command_timestamp_before_);
+    trace_->add_command_timestamp_sample(
+        graph_name_ + " request " + std::to_string(request_index_) + " command-after",
+        *command_timestamp_after_);
 }
 
 // ============================================================================
@@ -341,21 +501,46 @@ NpuGraph::NpuGraph(
     size_t num_requests,
     bool use_lite,
     std::span<const int64_t> fill_shape,
-    bool manual_blob_cache
+    bool manual_blob_cache,
+    ze_graph_profiling_dditable_ext_t* profiling_api,
+    TraceRecorder* trace
 ) : context_(context), device_(device), queue_pool_(queue_pool), graph_api_(graph_api),
     use_lite_(use_lite), fill_shape_(fill_shape.begin(), fill_shape.end()),
-    manual_blob_cache_(manual_blob_cache)
+    manual_blob_cache_(manual_blob_cache), profiling_api_(profiling_api), trace_(trace),
+    graph_name_(fs::path(model_path).stem().string())
 {
+    const auto total_start = std::chrono::steady_clock::now();
+    auto elapsed_ms = [](const auto& start) {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    };
+
+    const auto graph_start = std::chrono::steady_clock::now();
     init_graph(model_path);
+    load_stats_.graph_init_ms = elapsed_ms(graph_start);
+    if (trace_ && trace_->has_raw_dump_directory() && trace_->task_profiling_enabled()) {
+        const auto export_start = std::chrono::steady_clock::now();
+        std::string blob_name = graph_name_;
+        for (int64_t dim : fill_shape_) blob_name += "_" + std::to_string(dim);
+        trace_->dump_native_graph(graph_api_, graph_, std::move(blob_name));
+        load_stats_.profiling_blob_export_ms = elapsed_ms(export_start);
+    }
+
+    const auto query_start = std::chrono::steady_clock::now();
     query_arguments();
+    load_stats_.argument_query_ms = elapsed_ms(query_start);
 
     // Create the infer-request pool (software pipeline depth; queue/fence are
     // borrowed from the shared engine pool slot-by-slot)
+    const auto request_start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < num_requests; ++i) {
         requests_.push_back(std::make_unique<NpuInferRequest>(
-            context_, device_, &(*queue_pool_)[i], graph_, inputs_, outputs_, graph_api_
+            context_, device_, &(*queue_pool_)[i], graph_, inputs_, outputs_, graph_api_,
+            profiling_api_, trace_, graph_name_, i
         ));
     }
+    load_stats_.request_pool_ms = elapsed_ms(request_start);
+    load_stats_.total_ms = elapsed_ms(total_start);
 }
 
 NpuGraph::~NpuGraph() {
@@ -396,6 +581,10 @@ void NpuGraph::init_graph(const std::string& model_path) {
         // Shape templates carry fixed-width "0000" dims; they always go through
         // the driver JIT path with concrete dims filled in memory (bin reused).
         const bool shape_template = is_shape_template(xml_view);
+        if (shape_template && !use_lite_) {
+            throw std::invalid_argument(
+                "native-blob compilation does not support dynamic shape templates: " + p.string());
+        }
         if (shape_template) {
             std::cout << "  [*] Shape template detected (driver JIT load): " << p.filename().string() << "\n";
         }
@@ -453,9 +642,12 @@ void NpuGraph::init_graph(const std::string& model_path) {
             lite_desc.format = ZE_GRAPH_FORMAT_NGRAPH_LITE;
             lite_desc.inputSize = container.size();
             lite_desc.pInput = container.data();
-            // Never null: the driver calls strlen(pBuildFlags) on this path
-            lite_desc.pBuildFlags = "";
-            lite_desc.flags = manual_blob_cache_ ? ZE_GRAPH_FLAG_DISABLE_CACHING : ZE_GRAPH_FLAG_NONE;
+            // Never null: the driver calls strlen(pBuildFlags) on this path.
+            const std::string compiler_flags = compiler_build_flags();
+            lite_desc.pBuildFlags = compiler_flags.c_str();
+            lite_desc.flags = manual_blob_cache_ && !(trace_ && trace_->task_profiling_enabled())
+                ? ZE_GRAPH_FLAG_DISABLE_CACHING : ZE_GRAPH_FLAG_NONE;
+            if (trace_ && trace_->task_profiling_enabled()) lite_desc.flags |= ZE_GRAPH_FLAG_ENABLE_PROFILING;
 
             auto t0 = std::chrono::steady_clock::now();
             check_ze(graph_api_->pfnCreate2(context_, device_, &lite_desc, &graph_), "GraphCreate2(NGRAPH_LITE)");
@@ -525,6 +717,10 @@ void NpuGraph::init_graph(const std::string& model_path) {
             }
         }
     } else if (ext == ".ngraph_lite") {
+        if (!use_lite_) {
+            throw std::invalid_argument(
+                "NGRAPH_LITE model requires --graph-format ngraph-lite: " + p.string());
+        }
         // Single-file release artifact: patch the compiler version (4 bytes) and,
         // for shape templates, the placeholder dims inside the embedded XML, then
         // hand the container straight to the driver compiler. Weights are reused.
@@ -576,9 +772,12 @@ void NpuGraph::init_graph(const std::string& model_path) {
         lite_desc.format = ZE_GRAPH_FORMAT_NGRAPH_LITE;
         lite_desc.inputSize = container.size();
         lite_desc.pInput = container.data();
-        // Never null: the driver calls strlen(pBuildFlags) on this path
-        lite_desc.pBuildFlags = "";
-        lite_desc.flags = manual_blob_cache_ ? ZE_GRAPH_FLAG_DISABLE_CACHING : ZE_GRAPH_FLAG_NONE;
+        // Never null: the driver calls strlen(pBuildFlags) on this path.
+        const std::string compiler_flags = compiler_build_flags();
+        lite_desc.pBuildFlags = compiler_flags.c_str();
+        lite_desc.flags = manual_blob_cache_ && !(trace_ && trace_->task_profiling_enabled())
+            ? ZE_GRAPH_FLAG_DISABLE_CACHING : ZE_GRAPH_FLAG_NONE;
+        if (trace_ && trace_->task_profiling_enabled()) lite_desc.flags |= ZE_GRAPH_FLAG_ENABLE_PROFILING;
 
         auto t0 = std::chrono::steady_clock::now();
         check_ze(graph_api_->pfnCreate2(context_, device_, &lite_desc, &graph_), "GraphCreate2(NGRAPH_LITE)");
@@ -633,6 +832,7 @@ void NpuGraph::init_graph(const std::string& model_path) {
     desc.inputSize = buffer.size();
     desc.pInput = buffer.data();
     desc.pBuildFlags = nullptr;
+    if (trace_ && trace_->task_profiling_enabled()) desc.flags |= ZE_GRAPH_FLAG_ENABLE_PROFILING;
 
     check_ze(graph_api_->pfnCreate2(context_, device_, &desc, &graph_), "GraphCreate2");
     initialize_graph();
@@ -657,7 +857,9 @@ void NpuGraph::initialize_graph() {
 }
 
 bool NpuGraph::load_manual_blob_cache(const std::string& blob_path, bool fresh, const std::string& name) {
-    if (!manual_blob_cache_ || graph_api_->pfnGetNativeBinary2 == nullptr || !fresh) return false;
+    // Cached NATIVE blobs do not retain the task-level instrumentation this trace needs.
+    if ((trace_ && trace_->task_profiling_enabled()) || !manual_blob_cache_ ||
+        graph_api_->pfnGetNativeBinary2 == nullptr || !fresh) return false;
     return try_create_mapped(blob_path, name);
 }
 
@@ -676,6 +878,7 @@ bool NpuGraph::try_create_mapped(const std::string& path, const std::string& nam
     desc.pInput = mapped->data();
     desc.pBuildFlags = nullptr;
     desc.flags = ZE_GRAPH_FLAG_NONE;
+    if (trace_ && trace_->task_profiling_enabled()) desc.flags |= ZE_GRAPH_FLAG_ENABLE_PROFILING;
 
     auto t0 = std::chrono::steady_clock::now();
     const ze_result_t ret = graph_api_->pfnCreate2(context_, device_, &desc, &graph_);
@@ -700,7 +903,8 @@ bool NpuGraph::try_create_mapped(const std::string& path, const std::string& nam
 }
 
 bool NpuGraph::store_manual_blob_cache(const std::string& blob_path, const std::string& name) {
-    if (!manual_blob_cache_ || graph_api_->pfnGetNativeBinary2 == nullptr) return false;
+    if ((trace_ && trace_->task_profiling_enabled()) || !manual_blob_cache_ ||
+        graph_api_->pfnGetNativeBinary2 == nullptr) return false;
 
     size_t size = 0;
     const uint8_t* data = nullptr;
@@ -793,13 +997,13 @@ void NpuEngine::ensure_queue_pool(size_t count) {
         if (turbo_ && turbo_supported_) {
             queue_desc.pNext = &turbo_ext;
         } else if (turbo_ && !turbo_warned_) {
-            std::cerr << "[-] --turbo: ZE_extension_command_queue_npu is not exposed by the driver; "
+            std::cerr << "[-] --npu-low-latency: ZE_extension_command_queue_npu is not exposed by the driver; "
                          "using normal queues.\n";
             turbo_warned_ = true;
         }
         ze_result_t queue_ret = zeCommandQueueCreate(context_, device_, &queue_desc, &slot.queue);
         if (queue_ret != ZE_RESULT_SUCCESS && queue_desc.pNext != nullptr) {
-            std::cerr << "[-] --turbo: turbo queue create failed (0x" << std::hex << queue_ret
+            std::cerr << "[-] --npu-low-latency: low-latency queue create failed (0x" << std::hex << queue_ret
                       << std::dec << "); using a normal queue.\n";
             turbo_warned_ = true;
             queue_desc.pNext = nullptr;
@@ -913,8 +1117,37 @@ bool NpuEngine::initialize() {
     check_ze(zeContextCreate(driver_, &context_desc, &context_), "zeContextCreate");
 
     initialized_ = true;
+    if (trace_) set_trace_recorder(trace_);
     std::cout << "[+] Level Zero NPU Engine Initialized: " << device_name_ << "\n";
     return true;
+}
+
+void NpuEngine::set_trace_recorder(TraceRecorder* trace) {
+    trace_ = trace;
+    profiling_api_ = nullptr;
+    if (!trace_ || !initialized_) return;
+
+    if (trace_) {
+        ze_device_properties_t props{};
+        props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2;
+        if (zeDeviceGetProperties(device_, &props) == ZE_RESULT_SUCCESS)
+            trace_->set_device_timer_properties(props.timerResolution, props.timestampValidBits);
+    }
+    if (!trace_->task_profiling_enabled()) return;
+
+    void* table = nullptr;
+    const ze_result_t result = zeDriverGetExtensionFunctionAddress(
+        driver_, ZE_PROFILING_DATA_EXT_NAME, &table);
+    if (result != ZE_RESULT_SUCCESS || table == nullptr) {
+        throw std::runtime_error("NPU graph profiling extension is unavailable.");
+    }
+    profiling_api_ = static_cast<ze_graph_profiling_dditable_ext_t*>(table);
+    if (!profiling_api_->pfnProfilingPoolCreate || !profiling_api_->pfnProfilingPoolDestroy ||
+        !profiling_api_->pfnProfilingQueryCreate || !profiling_api_->pfnProfilingQueryDestroy ||
+        !profiling_api_->pfnProfilingQueryGetData) {
+        profiling_api_ = nullptr;
+        throw std::runtime_error("NPU graph profiling extension is missing required functions.");
+    }
 }
 
 std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path,
@@ -925,27 +1158,43 @@ std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path,
     }
     ensure_queue_pool(num_requests);
     return std::make_shared<NpuGraph>(context_, device_, &queue_pool_, model_path, graph_api_, num_requests,
-                                      use_lite_, fill_shape, manual_blob_cache_);
+                                      use_lite_, fill_shape, manual_blob_cache_, profiling_api_, trace_);
 }
 
 void NpuEngine::print_memory_usage(const char* tag) {
     if (graph_api_ == nullptr || graph_api_->pfnQueryContextMemory == nullptr) return;
+    const auto started = std::chrono::steady_clock::now();
+    ze_graph_memory_query_t mem{};
+    if (graph_api_->pfnQueryContextMemory(context_, ZE_GRAPH_QUERY_MEMORY_DDR, &mem) == ZE_RESULT_SUCCESS) {
+        std::cout << "[mem] " << tag << " DDR: allocated " << (mem.allocated / 1024)
+                  << " KB / total " << (mem.total / 1024) << " KB\n";
+    }
+    const double elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "[profile] memory query " << tag << " DDR=" << elapsed << " ms\n";
+}
+
+void NpuEngine::print_cache_usage(const char* tag) {
+    if (graph_api_ == nullptr || graph_api_->pfnQueryContextMemory == nullptr) return;
+    const auto started = std::chrono::steady_clock::now();
     struct Query {
         const char* label;
         ze_graph_memory_query_type_t type;
     };
     const Query queries[] = {
-        {"DDR", ZE_GRAPH_QUERY_MEMORY_DDR},
         {"driver cache", ZE_GRAPH_QUERY_MEMORY_DRIVER_CACHE},
         {"program cache", ZE_GRAPH_QUERY_MEMORY_PROGRAM_CACHE},
     };
     for (const auto& q : queries) {
         ze_graph_memory_query_t mem{};
         if (graph_api_->pfnQueryContextMemory(context_, q.type, &mem) == ZE_RESULT_SUCCESS) {
-            std::cout << "[mem] " << tag << " " << q.label << ": allocated " << (mem.allocated / 1024)
+            std::cout << "[cache] " << tag << " " << q.label << ": allocated " << (mem.allocated / 1024)
                       << " KB / total " << (mem.total / 1024) << " KB\n";
         }
     }
+    const double elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "[profile] cache query " << tag << " total=" << elapsed << " ms\n";
 }
 
 } // namespace ppocr
