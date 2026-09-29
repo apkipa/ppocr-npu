@@ -115,10 +115,12 @@ cmake --build build --config Release
 | `--det-mode <mode>` | 检测模式：`resize` 整图缩放或 `tile` 固定尺寸检测 | `resize` |
 | `--tile-size <n>` | `tile` 模式的 tile 边长；仅图像超过该尺寸时拆成多个 tile（32 到 960，且为 32 的倍数） | `960` |
 | `--det-relu-mul7` | 可选地将 Det `Mul.7` 的 GELU 替换为 ReLU（非等价变换，仅 640 图） | `false` |
+| `--det-input-u8` | 实验开关：Det 直接接收 BGR/NHWC U8，图内执行 ImageNet BGR 归一化和布局重排 | `false` |
 | `--rec-model-160 <path>` | 短词识别模型路径 ($W=160$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
 | `--rec-model-320 <path>` | 标准识别模型路径 ($W=320$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
 | `--rec-model-640 <path>` | 长句识别模型路径 ($W=640$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
 | `--rec-model-1280 <path>` | 超宽文本识别模型路径 ($W=1280$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
+| `--rec-input-u8` | 实验开关：Rec 直接接收 BGR/NHWC U8，图内执行转换、归一化和布局重排 | `false` |
 | `--dictionary <path>` | 字符映射字典文件路径 | `models/ppocr_keys_v1.txt` |
 | `--rec-scheduling <mode>` | 识别请求调度：`round-robin` 固定轮转或 `poll` 轮询已完成请求；`poll` 仅支持在途数为 2 | `round-robin` |
 | `--rec-inflight <n>` | 每个识别模型同时在途的请求数（1 到 8）；使用 `poll` 时必须为 2 | `2` |
@@ -131,6 +133,10 @@ cmake --build build --config Release
 | `--trace-raw-dir <path>` | 额外导出 RAW profiling buffer、profiling graph blob 和设备时钟采样（诊断用）；不能与 `--trace-mode timestamps` 同用 | 关闭 |
 | `--det-heatmap-dir <path>` | 导出每个检测 tile 的概率热力图及最终拼接图（PGM，后处理前；诊断用） | 关闭 |
 | `--cache-stats` | 查询并打印驱动/program cache 统计（诊断查询，可能较慢） | `false` |
+
+Det 也支持独立的 `--det-input-u8` A/B 开关。构建时使用 `scripts/build_models.py --det-input-u8`，生成 `ppocrv6_small_det_u8_template.xml`；默认 Det FP16 路径和 Rec 开关不受影响。模型侧使用与原 CPU 路径相同的 BGR 参数（mean=`[123.675,116.28,103.53]`，std=`[58.395,57.12,57.375]`），因此不是 Rec 的 `[127.5,127.5,127.5]` 参数。
+
+同一 `Z:\TrustedSpace\01.png` 的四配置交错热缓存测试中（全 FP16、仅 Det U8、仅 Rec U8、两者 U8；每种统计 9 次），全 FP16 端到端中位数为 **806.28 ms**，Det+Rec U8 为 **782.22 ms**（约快 3.0%）；模型加载后的 OCR pipeline 为 **639.28 -> 623.43 ms**（约快 2.5%）。Det CPU 预处理为 **7.13 -> 4.49 ms**，Rec normalize 为 **6.89 -> 0.54 ms**；但 Rec wait 基本不变（**274.87 -> 276.61 ms**），所以不能把整链路变化等同于 NPU 计算提速。四种配置均为 41 行且 OCR 输出逐条一致。详细阶段表、端到端范围和 Det/Rec TASK_LEVEL 四桶统计见[优化报告](docs/npu_optimization_report.md#detrec-u8-对整条-ocr-耗时的影响)。
 
 ### 检测缩放与切片规则
 
@@ -181,6 +187,8 @@ Rec 路由使用裁剪框在高度 48 px 下的自然宽度。不同数据源分
 另测了原始 mmap 与普通读取 LZ4 NATIVE blob 的热加载：Rec1280 的 `load_model` P50 为 14.55/21.64 ms，Det960 为 47.73/50.05 ms。LZ4 缩小了文件，但这组未清空系统文件缓存的实测没有变快；page-fault 数未采集，细节见优化报告。
 
 对四个 Rec NATIVE blob 做了 Zstd `-1` 固实打包实验：原始合计 48,644,376 B，默认窗口压到 36,760,358 B（节省 24.43%），`--long=25`（约 32 MiB 长距离窗口）压到 **12,243,617 B**（节省 74.83%）。热缓存微基准中，原始 `File.ReadAllBytes` P50 为 19.8 ms，固实流解压到内存管道为 50.0/49.2 ms（默认/长窗口），即压缩路径多约 29--30 ms；冷盘未测。长窗口额外进程内存约 32--34 MiB。它适合多个 Rec 桶合并发布，但不具备单个桶直接 mmap 的随机访问特性；完整数据和边界见优化报告。
+
+Rec 另有实验开关 `--rec-input-u8`：构建脚本用该参数生成 `ppocrv6_small_rec_u8_w*.xml`，输入为 BGR/NHWC U8，图内执行 `Convert + mean/scale + Transpose`。早期 `poll`/inflight=2 热缓存三次 A/B 中，Rec CPU normalize 从 **6.56--6.80 ms** 降到 **0.50--0.55 ms**，Rec pipeline P50 为 **530.94 -> 517.44 ms**；NPU command window P50 为 **291.98 -> 294.09 ms**，并未变短。早期 trace 观察到 `reorder_in_0/PermuteQuantize` DMA 事件；后续静态图 TASK_LEVEL 复测也观察到 U8 的 `Convert_*` DMA 和 SW 事件，因此不能把整条图内转换概括成全在 DMA。较新的四配置、默认 `round-robin` 九次热缓存对比见[优化报告](docs/npu_optimization_report.md#detrec-u8-对整条-ocr-耗时的影响)。U8 与 FP16 均识别 41 行且输出逐条一致。与 SimdPaddleOCR C# 同图结果仍受 C++ 检测后处理、CLS 缺失和框顺序差异影响，不能据此宣称已对齐官方 PaddleOCR。
 
 ---
 

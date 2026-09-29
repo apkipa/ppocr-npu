@@ -457,6 +457,76 @@ Z 盘，报告中的表格才是长期保留的实验记录。
 
 只增大单行宽度不会持续增加 NPU 并行任务。三个静态图的输出时间步分别为 20/40/80；对 profiling graph blob 统计，DPU task 总数为 284/300/303，SW task 为 170/170/168。全图 task 拓扑从 W=320 到 W=640 基本不再扩张。
 
+### Rec U8 输入融合实验
+
+新增 `--rec-input-u8` 作为显式实验开关。构建脚本的 `--rec-input-u8` 生成 `ppocrv6_small_rec_u8_w*.xml`：模型接口是 `[1,48,W,3] U8`（交错 BGR/NHWC），OpenVINO PrePostProcessor 在图内插入 `Convert(U8->FP16) -> Subtract/Multiply -> Transpose(NHWC->NCHW)`；C++ 只把 padded BGR 缓冲区复制到共享输入，不再执行 CPU FP16 归一化。默认 FP16 路径不变。
+
+正式 160/320/640/1280 四桶、`Z:\TrustedSpace\01.png`、`poll`/inflight=2，热缓存各跑 3 次（首轮另行预热）的 A/B：
+
+| 指标 | FP16 CPU 输入 | U8 图内预处理 | 差异 |
+|---|---:|---:|---:|
+| Rec normalize（3 次范围） | 6.56--6.80 ms | 0.50--0.55 ms | CPU 少约 6.1--6.3 ms |
+| Rec pipeline P50 | 530.94 ms | 517.44 ms | -13.50 ms（-2.5%） |
+| NPU command window P50 | 291.98 ms | 294.09 ms | +2.11 ms（+0.7%） |
+
+这组早期正式四桶 A/B 使用 `poll`/inflight=2，FP16 与 U8 两条路径均为 41 行且文本逐条一致。该轮 trace 曾观察到输入 `reorder_in_0/PermuteQuantize` DMA 事件。后续以三轮静态图 TASK_LEVEL trace 重新核对时，U8 Rec 输入链可见 `Convert_*` 的 DMA 和 SW 事件；因此不能笼统地说图内输入转换全都落在 DMA，也不能从旧 trace 推广为每种宽度和编译产物都无独立 SW task。后续按默认 round-robin 做的整链复测及每宽度任务记录见“Det/Rec U8 对整条 OCR 耗时的影响”。与 SimdPaddleOCR C# 同图结果相比，C# 也得到 41 行，但 C++ 与 C# 文本序列只有 19 个 matching blocks、SequenceMatcher ratio 46.3%；这个残余差异来自现有 C++ 检测后处理、CLS 缺失和框顺序，不是 U8/FP16 路径单独造成的。当前开关仍保持实验性质，不能据此宣称整条 OCR 链已完全对齐官方 PaddleOCR。
+
+### Det U8 输入融合实验
+
+新增独立的 `--det-input-u8` 开关；构建脚本使用 `--det-input-u8` 生成 `ppocrv6_small_det_u8_960x960.xml/.ngraph_lite/.blob` 及 `ppocrv6_small_det_u8_template.xml`。Det 的接口是 `[1,960,960,3] U8`（交错 BGR/NHWC），图内执行 `Convert(U8->FP16) -> mean/scale -> Transpose(NHWC->NCHW)`，C++ 在 resize、tile 和 single-tile 三条路径都直接复制 BGR U8。默认 Det FP16 NCHW 路径不变；显式传入 `--det-model` 时不会被开关覆盖。
+
+Det 的归一化参数与原 CPU 路径一致：BGR mean=`[0.485,0.456,0.406]*255`，scale/std=`[0.229,0.224,0.225]*255`。
+
+同一 `Z:\TrustedSpace\01.png`、同一 960 resize 路径、热缓存、FP16 Det 与 U8 Det 各运行 3 次：
+
+| 指标 | Det FP16 CPU 输入 | Det U8 图内预处理 | 观察 |
+|---|---:|---:|---:|
+| 检测框数 | 41/41/41 | 41/41/41 | 一致 |
+| OCR 输出行逐条比较 | 41/41 一致 | 41/41 一致 | 一致 |
+| Det resize/normalize 中位数 | 6.76 ms | 4.27 ms | -2.49 ms |
+| Det submission/wait 中位数 | 67.08 ms | 65.80 ms | -1.28 ms |
+| 端到端中位数 | 743.36 ms | 700.87 ms | 仅作观测，不单独归因 |
+
+端到端值包含跨进程的 NPU 调度和其他识别阶段波动；目前能直接归因于该改动的是 Det CPU 预处理下降约 2.5 ms，以及在这组热缓存运行中 command/wait 小幅下降。Det U8 的识别结果与默认 Det 完全一致，但仍属于实验开关，不能替代官方 Paddle runtime 对比。
+
+### Det/Rec U8 对整条 OCR 耗时的影响
+
+使用同一 `Z:\TrustedSpace\01.png`、960 resize、四个静态 Rec 桶和相同 dictionary，Rec 使用默认 `round-robin`/inflight=2，按轮次交错测试全 FP16、仅 Det U8、仅 Rec U8、Det+Rec U8。每种配置运行 10 轮；统一剔除第 1 轮预热，统计后续 9 轮热缓存结果。第 1 轮全 FP16 出现约 7.06 s 的冷编译耗时，因此不纳入任何配置的稳态统计。端到端时间包括图像读取、NPU 初始化、模型加载及 OCR；post-load pipeline 从模型加载完成后开始，不包含启动和模型加载。结果文件为 `Z:\TEMP\overall-{base,det8,rec8,both8}-{2..10}.txt`。
+
+| 配置 | 端到端 P50 | 端到端范围 | 模型加载 P50 | Post-load pipeline P50 | Det stage P50 | Rec pipeline P50 |
+|---|---:|---:|---:|---:|---:|---:|
+| Det FP16 + Rec FP16 | 806.28 ms | 741.57–834.38 ms | 102.26 ms | 639.28 ms | 116.47 ms | 515.67 ms |
+| Det U8 + Rec FP16 | 799.82 ms | 759.68–815.80 ms | 103.16 ms | 635.22 ms | 113.26 ms | 515.32 ms |
+| Det FP16 + Rec U8 | 784.16 ms | 756.31–835.29 ms | 101.25 ms | 636.88 ms | 116.72 ms | 514.44 ms |
+| Det U8 + Rec U8 | 782.22 ms | 748.71–808.50 ms | 103.03 ms | 623.43 ms | 105.94 ms | 508.22 ms |
+
+各阶段 CPU 输入/提交计时 P50（按全 FP16、仅 Det U8、仅 Rec U8、双 U8 顺序）：Det resize/normalize `7.13 / 4.38 / 7.20 / 4.49 ms`；Det submit/wait wall `105.31 / 105.44 / 105.52 / 98.99 ms`；Det output decode `3.44 / 3.53 / 3.38 / 3.27 ms`；Rec padding/copy `0.73 / 0.71 / 0.74 / 0.77 ms`；Rec normalize `6.89 / 6.80 / 0.55 / 0.54 ms`；Rec host submit `31.42 / 31.56 / 31.42 / 31.02 ms`；Rec wait `274.87 / 275.59 / 277.59 / 276.61 ms`；CTC decode `53.00 / 52.97 / 52.40 / 52.72 ms`。这说明直接、稳定可见的 CPU 节省在输入预处理；Rec wait 没有随 U8 缩短。各子计时含重叠或由事件聚合而来，不能把表内数字相加成总时长。
+
+CPU 输入准备的变化与设备执行要分开看：Det resize/normalize P50 为 `7.13 / 4.38 / 7.20 / 4.49 ms`，Rec normalize P50 为 `6.89 / 6.80 / 0.55 / 0.54 ms`（顺序同表）。Rec U8 省掉约 6.3 ms CPU 归一化；Det U8 省掉约 2.6 ms。端到端 P50 的 U8 双开相对 FP16 下降 24.06 ms（3.0%），post-load pipeline 下降 15.85 ms（2.5%）。其中阶段计时不是所有子计时的简单和：Det/Rec 含 submit、wait 及主机调度；明细 timer 可能包含在 wall timer 中，不能重复相加。
+
+四种配置检测均为 41 框，识别均为 41 行，round 10 的 41 条置信度/框/文本记录逐条一致。九轮端到端全距分别为全 FP16 `741.57–834.38 ms`、仅 Det U8 `759.68–815.80 ms`、仅 Rec U8 `756.31–835.29 ms`、双 U8 `748.71–808.50 ms`。波动相对观测到的 24 ms 中位数差不可忽略；因此 2.5–3.0% 是这台机器、这张图、当前请求深度和调度下的稳态中位数差，不作为所有输入上的保证。整进程端到端值包括运行时初始化和图加载，不是 NPU 单独计算时间。
+
+#### Det TASK_LEVEL 调度对比
+
+FP16/U8 Det 各运行 3 次 TASK_LEVEL trace，检测模型 command window 的三次值分别为 `60.455 / 60.166 / 60.715 ms` 与 `60.174 / 59.365 / 59.404 ms`，中位数 `60.455 -> 59.404 ms`（约少 1.05 ms，1.7%）。三个 FP16 窗口各有 1,998 条 DPU、3,159 条 DMA、772 条 SW 及 43–61 条 Bubble 记录；三个 U8 窗口各有 2,008 条 DPU、3,145 条 DMA、812 条 SW 及 25–67 条 Bubble 记录。它们是任务记录数，不等于独立算子数或并行硬件单元数。TASK_LEVEL trace 文件：`Z:\TEMP\det-trace-fp16{,-2,-3}.json` 与 `Z:\TEMP\det-trace-u8{,-2,-3}.json`。
+
+首层 `Conv.0` 不能只用“30 对 20”推导计算量。FP16 的 30 条 DPU 记录由 6 条 `reorder_in_0/PermuteQuantize` 相关记录（两集群）和 24 条卷积输出 tile 记录组成；U8 图则为 20 条 `slice_0..9` 卷积记录（两集群），输入 Convert 另有 DMA/SW 任务。因此，图像输入接口的类型/布局改变后，编译器产生了不同的首层切分及输入转换路径，但两边记录不是一一对应的相同 workload。按 trace 中 DPU 持续时间求和，FP16 `Conv.0` 总计约 2.042 ms（其中 reorder 相关约 0.688 ms），U8 slice 约 1.276 ms；这只能描述 task 记录持续时间，事件重叠，不是串行墙钟节省量。整个 Det command window 仅改善约 1 ms，不能据此声称 NPU 峰值算力提升。
+
+#### Rec 四桶 TASK_LEVEL 对比
+
+固定同一截图运行三轮；每轮模型请求数受真实文本长度路由影响。表中 command 是各图每次请求的窗口中位数；任务列是起始时间戳落在每个请求 command window 内的 TASK_LEVEL 事件记录条数中位数，按 DMA/DPU/SW/Bubble 分类。它们包括不同集群上的记录，不应解释为唯一硬件指令数。
+
+| 桶宽 W | 每模式请求数 | FP16 command P50 | U8 command P50 | FP16 记录 DMA/DPU/SW/Bubble | U8 记录 DMA/DPU/SW/Bubble |
+|---:|---:|---:|---:|---:|---:|
+| 160 | 42 | 2.561 ms | 2.574 ms | 864 / 324 / 250 / 4 | 863 / 326 / 254 / 4 |
+| 320 | 9 | 3.586 ms | 3.654 ms | 974 / 474 / 314 / 5 | 976 / 476 / 318 / 4 |
+| 640 | 195 | 3.672 ms | 3.699 ms | 950 / 571 / 316 / 3 | 952 / 573 / 320 / 1 |
+| 1280 | 9 | 7.750 ms | 7.295 ms | 1174 / 608 / 320 / 1 | 1190 / 608 / 324 / 1 |
+
+command window 全样本范围：W160 FP16/U8 为 `1.622–3.539 / 1.690–3.703 ms`；W320 为 `2.437–4.202 / 2.470–4.295 ms`；W640 为 `3.518–6.539 / 3.590–6.633 ms`；W1280 为 `7.170–11.653 / 6.941–10.977 ms`。W160/320/640 中 U8 设备窗口中位数持平或略慢；W1280 的 U8 中位数低约 0.46 ms，但只有 9 个窗口，且范围重叠，不能据此确认稳定提速。Rec trace 文件：`Z:\TEMP\rec-fp16-{1,2,3}.json` 与 `Z:\TEMP\rec-u8-{1,2,3}.json`。
+
+综合而言，U8 的确定收益首先是 CPU 输入预处理（尤其 Rec）明显减少；TASK_LEVEL 证据没有显示 Rec 各桶普遍更快，Det 设备窗口也只小幅下降。整体 OCR pipeline 的约 2.5% 改善是主机准备、请求提交/等待、Det/Rec 窗口及阶段重叠共同形成的应用级结果，不能归结为 NPU 计算吞吐本身提升。
+
 具体到末端分类头 `MatMul.12`，输出是 `[1,T,18710]`：W=160 时只有 6 个 DPU task，W=320 增至 18 个，W=640 仍为 18 个。54 组 Conv 型 DPU workload 中，53 组在三个宽度下都各有 2 个 task。也就是说，W=160 到 320 增加了可并行切片；320 到 640 主要让既有切片处理更长序列，没有继续增加并行度。这比“宽桶填充”更直接地解释了宽度与吞吐的关系。
 
 #### batch 与 CMX

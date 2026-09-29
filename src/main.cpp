@@ -75,12 +75,14 @@ void print_usage(const char* prog) {
     std::cout << "  --image <path>         Path to input image file (JPG, PNG, BMP, TIFF, WebP)\n";
     std::cout << "  --clipboard            Read image directly from Windows Clipboard\n";
     std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_template.xml]\n";
+    std::cout << "  --det-input-u8         Experimental Det BGR/NHWC U8 input with model-side preprocessing\n";
     std::cout << "  --det-mode <mode>      Detection mode: resize or tile (default resize)\n";
     std::cout << "  --tile-size <n>        Tile edge length in pixels (multiple of 32, 32-960; default 960)\n";
     std::cout << "  --rec-model-160 <path> Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
     std::cout << "  --rec-model-320 <path> Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
     std::cout << "  --rec-model-640 <path> Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
     std::cout << "  --rec-model-1280 <path> Path to Rec W=1280 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
+    std::cout << "  --rec-input-u8        Experimental Rec BGR/NHWC U8 input with model-side preprocessing\n";
     std::cout << "  --dictionary <path>    Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
     std::cout << "  --rec-scheduling <mode> Request selection: round-robin or poll (poll requires inflight=2)\n";
     std::cout << "  --rec-inflight <n>     In-flight requests per recognition graph (default 2, range 1-8)\n";
@@ -153,6 +155,13 @@ int main(int argc, char* argv[]) {
         std::string rec_320 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w320");
         std::string rec_640 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w640");
         std::string rec_1280 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w1280");
+        bool rec_input_u8 = false;
+        bool det_input_u8 = false;
+        bool det_model_explicit = false;
+        bool rec_model_160_explicit = false;
+        bool rec_model_320_explicit = false;
+        bool rec_model_640_explicit = false;
+        bool rec_model_1280_explicit = false;
         std::string dict_path = "models/ppocr_keys_v1.txt";
         std::string trace_path;
         std::string trace_raw_dir;
@@ -180,6 +189,7 @@ int main(int argc, char* argv[]) {
             } else if (arg == "--det-model") {
                 if (i + 1 >= argc) throw std::invalid_argument("--det-model requires a path");
                 det_model = argv[++i];
+                det_model_explicit = true;
             } else if (arg == "--det-mode") {
                 if (i + 1 >= argc) throw std::invalid_argument("--det-mode requires 'resize' or 'tile'");
                 const std::string value = argv[++i];
@@ -196,15 +206,23 @@ int main(int argc, char* argv[]) {
             } else if (arg == "--rec-model-160") {
                 if (i + 1 >= argc) throw std::invalid_argument("--rec-model-160 requires a path");
                 rec_160 = argv[++i];
+                rec_model_160_explicit = true;
             } else if (arg == "--rec-model-320") {
                 if (i + 1 >= argc) throw std::invalid_argument("--rec-model-320 requires a path");
                 rec_320 = argv[++i];
+                rec_model_320_explicit = true;
             } else if (arg == "--rec-model-640") {
                 if (i + 1 >= argc) throw std::invalid_argument("--rec-model-640 requires a path");
                 rec_640 = argv[++i];
+                rec_model_640_explicit = true;
             } else if (arg == "--rec-model-1280") {
                 if (i + 1 >= argc) throw std::invalid_argument("--rec-model-1280 requires a path");
                 rec_1280 = argv[++i];
+                rec_model_1280_explicit = true;
+            } else if (arg == "--rec-input-u8") {
+                rec_input_u8 = true;
+            } else if (arg == "--det-input-u8") {
+                det_input_u8 = true;
             } else if (arg == "--dictionary") {
                 if (i + 1 >= argc) throw std::invalid_argument("--dictionary requires a path");
                 dict_path = argv[++i];
@@ -259,6 +277,16 @@ int main(int argc, char* argv[]) {
             } else {
                 throw std::invalid_argument("unknown option: " + arg);
             }
+        }
+
+        if (rec_input_u8) {
+            if (!rec_model_160_explicit) rec_160 = resolve_model("models/ppocrv6_small_rec_u8_template");
+            if (!rec_model_320_explicit) rec_320 = resolve_model("models/ppocrv6_small_rec_u8_template");
+            if (!rec_model_640_explicit) rec_640 = resolve_model("models/ppocrv6_small_rec_u8_template");
+            if (!rec_model_1280_explicit) rec_1280 = resolve_model("models/ppocrv6_small_rec_u8_template");
+        }
+        if (det_input_u8 && !det_model_explicit) {
+            det_model = resolve_model("models/ppocrv6_small_det_u8_template");
         }
 
         if (tile_size_explicit && det_mode != DetMode::Tile)
@@ -345,11 +373,17 @@ int main(int argc, char* argv[]) {
         if (cache_stats) engine.print_cache_usage("[baseline]");
 
         // 3. Load Models
-        const std::array<int64_t, 4> det_fill_dims{1, 3, det_size, det_size};
+        const auto det_fill_dims = det_input_u8
+            ? std::array<int64_t, 4>{1, det_size, det_size, 3}
+            : std::array<int64_t, 4>{1, 3, det_size, det_size};
         constexpr std::array<int64_t, 4> kRec160Fill{1, 3, 48, 160};
         constexpr std::array<int64_t, 4> kRec320Fill{1, 3, 48, 320};
         constexpr std::array<int64_t, 4> kRec640Fill{1, 3, 48, 640};
         constexpr std::array<int64_t, 4> kRec1280Fill{1, 3, 48, 1280};
+        constexpr std::array<int64_t, 4> kRecU8_160Fill{1, 48, 160, 3};
+        constexpr std::array<int64_t, 4> kRecU8_320Fill{1, 48, 320, 3};
+        constexpr std::array<int64_t, 4> kRecU8_640Fill{1, 48, 640, 3};
+        constexpr std::array<int64_t, 4> kRecU8_1280Fill{1, 48, 1280, 3};
 
         auto load_profiled = [&](const char* label, const std::string& path, size_t requests,
                                  std::span<const int64_t> fill, double& elapsed_total_ms) {
@@ -372,8 +406,12 @@ int main(int argc, char* argv[]) {
         };
         const std::span<const int64_t> det_fill(det_fill_dims);
         std::cout << "[*] Loading Detection model onto NPU: " << det_model << "..." << std::endl;
+        if (det_input_u8) {
+            std::cout << "[*] Det input experiment: BGR/NHWC U8 with model-side preprocessing\n";
+        }
         auto det_graph = load_profiled("det", det_model, 2, det_fill, metrics.det_model_load_ms); // 2-deep tile pipeline (submit-ahead)
-        const size_t det_input_bytes = static_cast<size_t>(det_size) * det_size * 3 * sizeof(uint16_t);
+        const size_t det_input_bytes = static_cast<size_t>(det_size) * det_size * 3 *
+            (det_input_u8 ? sizeof(uint8_t) : sizeof(uint16_t));
         if (det_graph->inputs().empty() || det_graph->inputs()[0].total_bytes != det_input_bytes) {
             throw std::runtime_error("Detection graph input does not match the selected " +
                                      std::to_string(det_size) + "x" + std::to_string(det_size) +
@@ -385,20 +423,35 @@ int main(int argc, char* argv[]) {
         }
         if (cache_stats) engine.print_cache_usage("[after det]");
 
+        auto fill_det_input = [&](const ppocr::ImageBGR& image, void* destination) {
+            if (det_input_u8) {
+                std::memcpy(destination, image.data.data(), image.data.size());
+            } else {
+                ppocr::WicDecoder::normalize_to_nchw_fp16(image, destination);
+            }
+        };
+
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
-        auto rec_graph_160 = fs::exists(rec_160) ? load_profiled("rec160", rec_160, rec_depth, kRec160Fill, metrics.rec_model_load_ms) : nullptr;
+        if (rec_input_u8) {
+            std::cout << "[*] Rec input experiment: BGR/NHWC U8 with model-side preprocessing\n";
+        }
+        const auto& rec160_fill = rec_input_u8 ? kRecU8_160Fill : kRec160Fill;
+        const auto& rec320_fill = rec_input_u8 ? kRecU8_320Fill : kRec320Fill;
+        const auto& rec640_fill = rec_input_u8 ? kRecU8_640Fill : kRec640Fill;
+        const auto& rec1280_fill = rec_input_u8 ? kRecU8_1280Fill : kRec1280Fill;
+        auto rec_graph_160 = fs::exists(rec_160) ? load_profiled("rec160", rec_160, rec_depth, rec160_fill, metrics.rec_model_load_ms) : nullptr;
         if (metrics.enabled) {
             engine.print_memory_usage("[after rec160]");
             print_process_memory_usage("[after rec160]");
         }
         if (cache_stats) engine.print_cache_usage("[after rec160]");
-        auto rec_graph_320 = fs::exists(rec_320) ? load_profiled("rec320", rec_320, rec_depth, kRec320Fill, metrics.rec_model_load_ms) : nullptr;
+        auto rec_graph_320 = fs::exists(rec_320) ? load_profiled("rec320", rec_320, rec_depth, rec320_fill, metrics.rec_model_load_ms) : nullptr;
         if (metrics.enabled) {
             engine.print_memory_usage("[after rec320]");
             print_process_memory_usage("[after rec320]");
         }
         if (cache_stats) engine.print_cache_usage("[after rec320]");
-        auto rec_graph_640 = fs::exists(rec_640) ? load_profiled("rec640", rec_640, rec_depth, kRec640Fill, metrics.rec_model_load_ms) : nullptr;
+        auto rec_graph_640 = fs::exists(rec_640) ? load_profiled("rec640", rec_640, rec_depth, rec640_fill, metrics.rec_model_load_ms) : nullptr;
         ProcessMemorySnapshot after_rec640;
         std::optional<uint64_t> npu_after_rec640;
         if (metrics.enabled) {
@@ -406,7 +459,7 @@ int main(int argc, char* argv[]) {
             after_rec640 = print_process_memory_usage("[after rec640]");
         }
         if (cache_stats) engine.print_cache_usage("[after rec640]");
-        auto rec_graph_1280 = fs::exists(rec_1280) ? load_profiled("rec1280", rec_1280, rec_depth, kRec1280Fill, metrics.rec_model_load_ms) : nullptr;
+        auto rec_graph_1280 = fs::exists(rec_1280) ? load_profiled("rec1280", rec_1280, rec_depth, rec1280_fill, metrics.rec_model_load_ms) : nullptr;
         if (metrics.enabled) {
             const auto npu_after_rec1280 = engine.print_memory_usage("[after rec1280]");
             const auto after_rec1280 = print_process_memory_usage("[after rec1280]");
@@ -416,10 +469,12 @@ int main(int argc, char* argv[]) {
         if (cache_stats) engine.print_cache_usage("[after rec1280]");
         metrics.model_load_ms = metrics.det_model_load_ms + metrics.rec_model_load_ms;
 
-        auto validate_rec_shape = [](const std::shared_ptr<ppocr::NpuGraph>& graph, int width,
-                                     const char* label) {
+        auto validate_rec_shape = [rec_input_u8](const std::shared_ptr<ppocr::NpuGraph>& graph, int width,
+                                                  const char* label) {
             if (!graph) return;
-            const std::vector<uint32_t> expected_dims{1, 3, 48, static_cast<uint32_t>(width)};
+            const std::vector<uint32_t> expected_dims = rec_input_u8
+                ? std::vector<uint32_t>{1, 48, static_cast<uint32_t>(width), 3}
+                : std::vector<uint32_t>{1, 3, 48, static_cast<uint32_t>(width)};
             if (graph->inputs().empty() || graph->inputs()[0].dims != expected_dims) {
                 throw std::runtime_error(std::string(label) + " graph input does not match W=" +
                                          std::to_string(width) +
@@ -445,7 +500,7 @@ int main(int argc, char* argv[]) {
 
         if (det_mode == DetMode::Resize) {
             if (det_graph->inputs().empty() ||
-                det_graph->inputs()[0].total_bytes != static_cast<size_t>(960) * 960 * 3 * 2) {
+                det_graph->inputs()[0].total_bytes != det_input_bytes) {
                 throw std::runtime_error("960 resize mode requires a 960x960 det graph (use the shape template)");
             }
 
@@ -466,6 +521,7 @@ int main(int argc, char* argv[]) {
             auto& req = det_graph->get_request(0);
             {
                 ppocr::ScopedTimer timer(metrics.det_preprocess_ms, metrics.trace, "Det preprocess");
+                // TODO: Resize/pad Det U8 directly into req USM instead of staging resized and bucket images.
                 ppocr::ImageBGR resized = ppocr::WicDecoder::resize_linear(src_image, tw, th);
 
                 ppocr::ImageBGR bucket;
@@ -478,7 +534,7 @@ int main(int argc, char* argv[]) {
                                 resized.data.data() + static_cast<size_t>(y) * tw * 3,
                                 static_cast<size_t>(tw) * 3);
                 }
-                ppocr::WicDecoder::normalize_to_nchw_fp16(bucket, req.get_input_ptr(0));
+                fill_det_input(bucket, req.get_input_ptr(0));
             }
             {
                 ppocr::ScopedTimer timer(metrics.det_inference_ms, metrics.trace, "Det host submit + wait");
@@ -531,6 +587,7 @@ int main(int argc, char* argv[]) {
                 ppocr::ImageBGR tile_img;
             };
 
+            // TODO: After each slot is free, extract its tile directly into U8 USM instead of storing tile_img buffers.
             std::vector<TileTask> tasks;
             {
                 ppocr::ScopedTimer timer(metrics.tile_prep_ms, metrics.trace, "Det tile preparation");
@@ -564,7 +621,7 @@ int main(int argc, char* argv[]) {
 
                     {
                         ppocr::ScopedTimer timer(metrics.det_preprocess_ms, metrics.trace, "Det preprocess");
-                        ppocr::WicDecoder::normalize_to_nchw_fp16(tasks[i].tile_img, req.get_input_ptr(0));
+                        fill_det_input(tasks[i].tile_img, req.get_input_ptr(0));
                     }
                     req.start_async();
                 }
@@ -604,6 +661,7 @@ int main(int argc, char* argv[]) {
         } else {
             // Single-shot Detection
             metrics.det_tile_count = 1;
+            // TODO: Extract the single Det U8 tile directly into the request USM.
             ppocr::ImageBGR single_tile;
             {
                 ppocr::ScopedTimer timer(metrics.tile_prep_ms, metrics.trace, "Det tile preparation");
@@ -613,7 +671,7 @@ int main(int argc, char* argv[]) {
             auto& req = det_graph->get_request(0);
             {
                 ppocr::ScopedTimer timer(metrics.det_preprocess_ms, metrics.trace, "Det preprocess");
-                ppocr::WicDecoder::normalize_to_nchw_fp16(single_tile, req.get_input_ptr(0));
+                fill_det_input(single_tile, req.get_input_ptr(0));
             }
 
             {
@@ -711,6 +769,7 @@ int main(int argc, char* argv[]) {
 
                 for (size_t b = 0; b < boxes.size(); ++b) {
                     auto& box = boxes[b];
+                    // TODO: Derive natural width first, reclaim the bucket request, then warp and pad U8 directly into its USM input.
                     // Crop quad normalized to height 48, with natural uncompressed width
                     ppocr::ImageBGR natural_crop;
                     {
@@ -785,10 +844,14 @@ int main(int argc, char* argv[]) {
                         auto& req = target_graph->get_request(slot);
                         {
                             ppocr::ScopedTimer timer(metrics.rec_preprocess_ms, metrics.trace, "Rec preprocess");
-                            ppocr::WicDecoder::normalize_to_nchw_fp16(
-                                padded_crop, req.get_input_ptr(0),
-                                127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
-                            );
+                            if (rec_input_u8) {
+                                std::memcpy(req.get_input_ptr(0), padded_crop.data.data(), padded_crop.data.size());
+                            } else {
+                                ppocr::WicDecoder::normalize_to_nchw_fp16(
+                                    padded_crop, req.get_input_ptr(0),
+                                    127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
+                                );
+                            }
                         }
 
                         {
@@ -849,10 +912,14 @@ int main(int argc, char* argv[]) {
                             auto& req = target_graph->get_request(s % 2);
                             {
                                 ppocr::ScopedTimer timer(metrics.rec_preprocess_ms, metrics.trace, "Rec preprocess");
-                                ppocr::WicDecoder::normalize_to_nchw_fp16(
-                                    slice_img, req.get_input_ptr(0),
-                                    127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
-                                );
+                                if (rec_input_u8) {
+                                    std::memcpy(req.get_input_ptr(0), slice_img.data.data(), slice_img.data.size());
+                                } else {
+                                    ppocr::WicDecoder::normalize_to_nchw_fp16(
+                                        slice_img, req.get_input_ptr(0),
+                                        127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f
+                                    );
+                                }
                             }
 
                             {

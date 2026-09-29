@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import openvino as ov
 import openvino.runtime.passes as passes
+from openvino.preprocess import ColorFormat, PrePostProcessor
 
 
 def package_ngraph_lite(xml_path: Path, bin_path: Path, output_path: Path):
@@ -111,7 +112,8 @@ def optimize_det_activations(model):
 
 
 def optimize_det_model(onnx_path: Path, output_dir: Path, size: int = 640,
-                       replace_mul7_relu: bool = False) -> tuple[Path, Path]:
+                       replace_mul7_relu: bool = False,
+                       input_u8: bool = False) -> tuple[Path, Path]:
     """Builds optimized Det model at static resolution."""
     print(f"\n[1/3] Building Optimized Det Model (Size: {size}x{size})...")
     core = ov.Core()
@@ -128,18 +130,33 @@ def optimize_det_model(onnx_path: Path, output_dir: Path, size: int = 640,
             raise ValueError("--det-relu-mul7 is validated only for a 640x640 Det graph")
         optimize_det_activations(model)
 
-    xml_path = output_dir / f"ppocrv6_small_det_{size}x{size}.xml"
-    bin_path = output_dir / f"ppocrv6_small_det_{size}x{size}.bin"
+    if input_u8:
+        # Expose the decoder's interleaved BGR buffer directly.  Keep the
+        # model's original NCHW contract after the compiler-visible conversion.
+        ppp = PrePostProcessor(model)
+        ppp_input = ppp.input()
+        ppp_input.tensor().set_element_type(ov.Type.u8).set_layout("NHWC").set_color_format(ColorFormat.BGR)
+        ppp_input.preprocess().convert_element_type(ov.Type.f16) \
+            .mean([0.485 * 255.0, 0.456 * 255.0, 0.406 * 255.0]) \
+            .scale([0.229 * 255.0, 0.224 * 255.0, 0.225 * 255.0])
+        ppp_input.model().set_layout("NCHW")
+        model = ppp.build()
+        print("  [+] Experimental input fusion: BGR/NHWC U8 -> NCHW FP16")
+
+    stem = f"ppocrv6_small_det_u8_{size}x{size}" if input_u8 else f"ppocrv6_small_det_{size}x{size}"
+    xml_path = output_dir / f"{stem}.xml"
+    bin_path = output_dir / f"{stem}.bin"
     ov.save_model(model, str(xml_path))
     print(f"  [+] Saved Det IR: {xml_path.name} ({xml_path.stat().st_size / 1024:.1f} KB, bin: {bin_path.stat().st_size / 1024 / 1024:.2f} MB)")
 
     # Create NGRAPH_LITE package
-    lite_path = output_dir / f"ppocrv6_small_det_{size}x{size}.ngraph_lite"
+    lite_path = output_dir / f"{stem}.ngraph_lite"
     package_ngraph_lite(xml_path, bin_path, lite_path)
     return xml_path, bin_path
 
 
-def optimize_rec_bucket(onnx_path: Path, output_dir: Path, width: int, remove_softmax: bool = True) -> tuple[Path, Path]:
+def optimize_rec_bucket(onnx_path: Path, output_dir: Path, width: int, remove_softmax: bool = True,
+                        input_u8: bool = False) -> tuple[Path, Path]:
     """Builds optimized Rec model for a specific width bucket with verified V1-V3 optimizations."""
     print(f"\nBuilding Rec Bucket: 48x{width} (remove_softmax={remove_softmax})...")
     core = ov.Core()
@@ -162,12 +179,27 @@ def optimize_rec_bucket(onnx_path: Path, output_dir: Path, width: int, remove_so
                 res.input(0).replace_source_output(logits_source)
                 print("  [+] V3: Final Softmax eliminated. Output redirected to unnormalized Logits.")
 
-    xml_path = output_dir / f"ppocrv6_small_rec_w{width}.xml"
-    bin_path = output_dir / f"ppocrv6_small_rec_w{width}.bin"
+    if input_u8:
+        # Keep the model-side layout NCHW while exposing the real decoder buffer
+        # as interleaved BGR/NHWC U8. The compiler can lower this pre-processing
+        # chain to its input reorder/quantize DMA path when supported.
+        ppp = PrePostProcessor(model)
+        ppp_input = ppp.input()
+        ppp_input.tensor().set_element_type(ov.Type.u8).set_layout("NHWC").set_color_format(ColorFormat.BGR)
+        ppp_input.preprocess().convert_element_type(ov.Type.f16) \
+            .mean([127.5, 127.5, 127.5]) \
+            .scale([127.5, 127.5, 127.5])
+        ppp_input.model().set_layout("NCHW")
+        model = ppp.build()
+        print("  [+] Experimental input fusion: BGR/NHWC U8 -> NCHW FP16")
+
+    stem = f"ppocrv6_small_rec_u8_w{width}" if input_u8 else f"ppocrv6_small_rec_w{width}"
+    xml_path = output_dir / f"{stem}.xml"
+    bin_path = output_dir / f"{stem}.bin"
     ov.save_model(model, str(xml_path))
     print(f"  [+] Saved Rec IR: {xml_path.name} ({xml_path.stat().st_size / 1024:.1f} KB, bin: {bin_path.stat().st_size / 1024 / 1024:.2f} MB)")
 
-    lite_path = output_dir / f"ppocrv6_small_rec_w{width}.ngraph_lite"
+    lite_path = output_dir / f"{stem}.ngraph_lite"
     package_ngraph_lite(xml_path, bin_path, lite_path)
     return xml_path, bin_path
 
@@ -197,7 +229,11 @@ def main():
                         help="Detection resolution (default 960 for the default whole-image resize path)")
     parser.add_argument("--det-relu-mul7", action="store_true",
                         help="Opt in to the validated but non-equivalent Mul.7 GELU->ReLU rewrite (640x640 only)")
+    parser.add_argument("--det-input-u8", action="store_true",
+                        help="Experimental Det input: BGR/NHWC U8 with model-side preprocessing")
     parser.add_argument("--rec-widths", nargs="+", type=int, default=[160, 320, 640, 1280], help="Recognition width buckets")
+    parser.add_argument("--rec-input-u8", action="store_true",
+                        help="Experimental Rec input: BGR/NHWC U8 with model-side preprocessing")
     parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries for NPU")
     parser.add_argument("--no-templates", action="store_true", help="Skip shape template generation (.xml/.bin/.ngraph_lite)")
     args = parser.parse_args()
@@ -223,33 +259,36 @@ def main():
 
     # 1. Optimize Det Model
     det_xml, _ = optimize_det_model(args.det_onnx, args.output_dir, size=args.det_size,
-                                    replace_mul7_relu=args.det_relu_mul7)
+                                    replace_mul7_relu=args.det_relu_mul7,
+                                    input_u8=args.det_input_u8)
     if args.compile_blobs:
-        det_blob = args.output_dir / f"ppocrv6_small_det_{args.det_size}x{args.det_size}.blob"
+        det_stem = f"ppocrv6_small_det_u8_{args.det_size}x{args.det_size}" if args.det_input_u8 else f"ppocrv6_small_det_{args.det_size}x{args.det_size}"
+        det_blob = args.output_dir / f"{det_stem}.blob"
         compile_npu_blob(det_xml, det_blob)
 
     # 2. Optimize Rec Multi-Buckets
     print("\n[2/3] Building Optimized Rec Multi-Bucket Models...")
     for width in args.rec_widths:
-        rec_xml, _ = optimize_rec_bucket(args.rec_onnx, args.output_dir, width=width, remove_softmax=True)
+        rec_xml, _ = optimize_rec_bucket(args.rec_onnx, args.output_dir, width=width, remove_softmax=True,
+                                          input_u8=args.rec_input_u8)
         if args.compile_blobs:
-            rec_blob = args.output_dir / f"ppocrv6_small_rec_w{width}.blob"
+            stem = f"ppocrv6_small_rec_u8_w{width}" if args.rec_input_u8 else f"ppocrv6_small_rec_w{width}"
+            rec_blob = args.output_dir / f"{stem}.blob"
             compile_npu_blob(rec_xml, rec_blob)
 
     # 2b. Shape templates: readable xml/bin for development + single-file NGRAPH_LITE
     if not args.no_templates:
         print("\n[2b/3] Building shape templates...")
         make_shape_template(
-            args.output_dir / f"ppocrv6_small_det_{args.det_size}x{args.det_size}.xml",
-            args.output_dir / "ppocrv6_small_det_template.xml",
-            ["1", "3", "0000", "0000"],
+            args.output_dir / (f"ppocrv6_small_det_u8_{args.det_size}x{args.det_size}.xml" if args.det_input_u8 else f"ppocrv6_small_det_{args.det_size}x{args.det_size}.xml"),
+            args.output_dir / ("ppocrv6_small_det_u8_template.xml" if args.det_input_u8 else "ppocrv6_small_det_template.xml"),
+            ["1", "0000", "0000", "3"] if args.det_input_u8 else ["1", "3", "0000", "0000"],
         )
         ref_width = 320 if 320 in args.rec_widths else args.rec_widths[0]
-        make_shape_template(
-            args.output_dir / f"ppocrv6_small_rec_w{ref_width}.xml",
-            args.output_dir / "ppocrv6_small_rec_template.xml",
-            ["1", "3", "48", "0000"],
-        )
+        rec_stem = f"ppocrv6_small_rec_u8_w{ref_width}" if args.rec_input_u8 else f"ppocrv6_small_rec_w{ref_width}"
+        rec_template_name = "ppocrv6_small_rec_u8_template.xml" if args.rec_input_u8 else "ppocrv6_small_rec_template.xml"
+        rec_template_dims = ["1", "0000", "0000", "3"] if args.rec_input_u8 else ["1", "3", "48", "0000"]
+        make_shape_template(args.output_dir / f"{rec_stem}.xml", args.output_dir / rec_template_name, rec_template_dims)
 
     # 3. Export character dictionary directly from inference.yml
     dict_dest = args.output_dir / "ppocr_keys_v1.txt"
