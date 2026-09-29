@@ -1161,17 +1161,20 @@ std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path,
                                       use_lite_, fill_shape, manual_blob_cache_, profiling_api_, trace_);
 }
 
-void NpuEngine::print_memory_usage(const char* tag) {
-    if (graph_api_ == nullptr || graph_api_->pfnQueryContextMemory == nullptr) return;
+std::optional<uint64_t> NpuEngine::print_memory_usage(const char* tag) {
+    if (graph_api_ == nullptr || graph_api_->pfnQueryContextMemory == nullptr) return std::nullopt;
     const auto started = std::chrono::steady_clock::now();
     ze_graph_memory_query_t mem{};
-    if (graph_api_->pfnQueryContextMemory(context_, ZE_GRAPH_QUERY_MEMORY_DDR, &mem) == ZE_RESULT_SUCCESS) {
+    const bool queried = graph_api_->pfnQueryContextMemory(context_, ZE_GRAPH_QUERY_MEMORY_DDR, &mem) == ZE_RESULT_SUCCESS;
+    if (queried) {
         std::cout << "[mem] " << tag << " DDR: allocated " << (mem.allocated / 1024)
                   << " KB / total " << (mem.total / 1024) << " KB\n";
     }
     const double elapsed = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     std::cout << "[profile] memory query " << tag << " DDR=" << elapsed << " ms\n";
+    if (!queried) return std::nullopt;
+    return mem.allocated / 1024;
 }
 
 void NpuEngine::print_cache_usage(const char* tag) {

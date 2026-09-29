@@ -8,6 +8,8 @@
 #include "wic_decoder.hpp"
 
 #include <windows.h>
+#define PSAPI_VERSION 2
+#include <psapi.h>
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -15,12 +17,54 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+struct ProcessMemorySnapshot {
+    SIZE_T working_set = 0;
+    SIZE_T private_bytes = 0;
+    bool valid = false;
+};
+
+ProcessMemorySnapshot print_process_memory_usage(const char* tag) {
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                              sizeof(counters))) {
+        std::cerr << "[mem] Process " << tag << ": GetProcessMemoryInfo failed ("
+                  << GetLastError() << ")\n";
+        return {};
+    }
+
+    std::cout << "[mem] Process " << tag << ": working set "
+              << (counters.WorkingSetSize / 1024) << " KB, private bytes "
+              << (counters.PrivateUsage / 1024) << " KB\n";
+    return {counters.WorkingSetSize, counters.PrivateUsage, true};
+}
+
+void print_process_memory_delta(const char* tag, const ProcessMemorySnapshot& before,
+                                const ProcessMemorySnapshot& after) {
+    if (!before.valid || !after.valid) return;
+    const auto delta_kb = [](SIZE_T after_bytes, SIZE_T before_bytes) -> int64_t {
+        return (static_cast<int64_t>(after_bytes) - static_cast<int64_t>(before_bytes)) / 1024;
+    };
+    std::cout << "[mem] Process " << tag << " delta: working set "
+              << delta_kb(after.working_set, before.working_set) << " KB, private bytes "
+              << delta_kb(after.private_bytes, before.private_bytes) << " KB\n";
+}
+
+void print_npu_memory_delta(const char* tag, const std::optional<uint64_t>& before_kb,
+                            const std::optional<uint64_t>& after_kb) {
+    if (!before_kb || !after_kb) return;
+    const auto delta_kb = static_cast<int64_t>(*after_kb) - static_cast<int64_t>(*before_kb);
+    std::cout << "[mem] NPU DDR " << tag << " delta: " << delta_kb << " KB\n";
+}
 
 void print_usage(const char* prog) {
     std::cout << "PP-OCRv6 Intel NPU (Level Zero Native) Inference Engine\n";
@@ -36,6 +80,7 @@ void print_usage(const char* prog) {
     std::cout << "  --rec-model-160 <path> Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
     std::cout << "  --rec-model-320 <path> Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
     std::cout << "  --rec-model-640 <path> Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
+    std::cout << "  --rec-model-1280 <path> Path to Rec W=1280 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
     std::cout << "  --dictionary <path>    Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
     std::cout << "  --rec-scheduling <mode> Request selection: round-robin or poll (poll requires inflight=2)\n";
     std::cout << "  --rec-inflight <n>     In-flight requests per recognition graph (default 2, range 1-8)\n";
@@ -107,6 +152,7 @@ int main(int argc, char* argv[]) {
         std::string rec_160 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w160");
         std::string rec_320 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w320");
         std::string rec_640 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w640");
+        std::string rec_1280 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w1280");
         std::string dict_path = "models/ppocr_keys_v1.txt";
         std::string trace_path;
         std::string trace_raw_dir;
@@ -156,6 +202,9 @@ int main(int argc, char* argv[]) {
             } else if (arg == "--rec-model-640") {
                 if (i + 1 >= argc) throw std::invalid_argument("--rec-model-640 requires a path");
                 rec_640 = argv[++i];
+            } else if (arg == "--rec-model-1280") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-model-1280 requires a path");
+                rec_1280 = argv[++i];
             } else if (arg == "--dictionary") {
                 if (i + 1 >= argc) throw std::invalid_argument("--dictionary requires a path");
                 dict_path = argv[++i];
@@ -289,7 +338,10 @@ int main(int argc, char* argv[]) {
         engine.set_ngraph_lite(use_lite);
         engine.set_manual_blob_cache(blob_cache);
         engine.set_turbo(low_latency);
-        if (metrics.enabled) engine.print_memory_usage("[baseline]");
+        if (metrics.enabled) {
+            engine.print_memory_usage("[baseline]");
+            print_process_memory_usage("[baseline]");
+        }
         if (cache_stats) engine.print_cache_usage("[baseline]");
 
         // 3. Load Models
@@ -297,6 +349,7 @@ int main(int argc, char* argv[]) {
         constexpr std::array<int64_t, 4> kRec160Fill{1, 3, 48, 160};
         constexpr std::array<int64_t, 4> kRec320Fill{1, 3, 48, 320};
         constexpr std::array<int64_t, 4> kRec640Fill{1, 3, 48, 640};
+        constexpr std::array<int64_t, 4> kRec1280Fill{1, 3, 48, 1280};
 
         auto load_profiled = [&](const char* label, const std::string& path, size_t requests,
                                  std::span<const int64_t> fill, double& elapsed_total_ms) {
@@ -326,19 +379,41 @@ int main(int argc, char* argv[]) {
                                      std::to_string(det_size) + "x" + std::to_string(det_size) +
                                      " bucket; use a matching shape template or --tile-size");
         }
-        if (metrics.enabled) engine.print_memory_usage("[after det]");
+        if (metrics.enabled) {
+            engine.print_memory_usage("[after det]");
+            print_process_memory_usage("[after det]");
+        }
         if (cache_stats) engine.print_cache_usage("[after det]");
 
         std::cout << "[*] Loading Recognition Multi-Buckets onto NPU...\n";
         auto rec_graph_160 = fs::exists(rec_160) ? load_profiled("rec160", rec_160, rec_depth, kRec160Fill, metrics.rec_model_load_ms) : nullptr;
-        if (metrics.enabled) engine.print_memory_usage("[after rec160]");
+        if (metrics.enabled) {
+            engine.print_memory_usage("[after rec160]");
+            print_process_memory_usage("[after rec160]");
+        }
         if (cache_stats) engine.print_cache_usage("[after rec160]");
         auto rec_graph_320 = fs::exists(rec_320) ? load_profiled("rec320", rec_320, rec_depth, kRec320Fill, metrics.rec_model_load_ms) : nullptr;
-        if (metrics.enabled) engine.print_memory_usage("[after rec320]");
+        if (metrics.enabled) {
+            engine.print_memory_usage("[after rec320]");
+            print_process_memory_usage("[after rec320]");
+        }
         if (cache_stats) engine.print_cache_usage("[after rec320]");
         auto rec_graph_640 = fs::exists(rec_640) ? load_profiled("rec640", rec_640, rec_depth, kRec640Fill, metrics.rec_model_load_ms) : nullptr;
-        if (metrics.enabled) engine.print_memory_usage("[after rec640]");
+        ProcessMemorySnapshot after_rec640;
+        std::optional<uint64_t> npu_after_rec640;
+        if (metrics.enabled) {
+            npu_after_rec640 = engine.print_memory_usage("[after rec640]");
+            after_rec640 = print_process_memory_usage("[after rec640]");
+        }
         if (cache_stats) engine.print_cache_usage("[after rec640]");
+        auto rec_graph_1280 = fs::exists(rec_1280) ? load_profiled("rec1280", rec_1280, rec_depth, kRec1280Fill, metrics.rec_model_load_ms) : nullptr;
+        if (metrics.enabled) {
+            const auto npu_after_rec1280 = engine.print_memory_usage("[after rec1280]");
+            const auto after_rec1280 = print_process_memory_usage("[after rec1280]");
+            print_npu_memory_delta("rec1280 graph + request pool", npu_after_rec640, npu_after_rec1280);
+            print_process_memory_delta("rec1280 graph + request pool", after_rec640, after_rec1280);
+        }
+        if (cache_stats) engine.print_cache_usage("[after rec1280]");
         metrics.model_load_ms = metrics.det_model_load_ms + metrics.rec_model_load_ms;
 
         auto validate_rec_shape = [](const std::shared_ptr<ppocr::NpuGraph>& graph, int width,
@@ -354,6 +429,7 @@ int main(int argc, char* argv[]) {
         validate_rec_shape(rec_graph_160, 160, "rec160");
         validate_rec_shape(rec_graph_320, 320, "rec320");
         validate_rec_shape(rec_graph_640, 640, "rec640");
+        validate_rec_shape(rec_graph_1280, 1280, "rec1280");
 
         const auto dict_load_start = ppocr::TraceRecorder::Clock::now();
         ppocr::CtcDecoder ctc_decoder(dict_path);
@@ -593,7 +669,7 @@ int main(int argc, char* argv[]) {
 
         // 6. Text Recognition Stage with Aspect-Ratio Preserving Tiling & Grid Logits Stitching
         if (!boxes.empty()) {
-            if (!rec_graph_160 && !rec_graph_320 && !rec_graph_640) {
+            if (!rec_graph_160 && !rec_graph_320 && !rec_graph_640 && !rec_graph_1280) {
                 std::cerr << "[-] Notice: No recognition models found. Detection boxes output only.\n";
             } else {
                 ppocr::ScopedTimer rec_pipeline_timer(
@@ -644,20 +720,23 @@ int main(int argc, char* argv[]) {
 
                     int natural_w = natural_crop.width;
 
-                    // CASE 1: Standard single-bucket inference (natural_w <= 640)
-                    if (natural_w <= 640) {
+                    // Use a single bucket through W=1280; preserve the W=640 sliding fallback above it.
+                    if (natural_w <= 640 || (natural_w <= 1280 && rec_graph_1280)) {
                         int target_w = 320;
                         std::shared_ptr<ppocr::NpuGraph> target_graph = rec_graph_320;
 
                         if (natural_w <= 160 && rec_graph_160) {
                             target_w = 160;
                             target_graph = rec_graph_160;
-                        } else if (natural_w > 320 && rec_graph_640) {
+                        } else if (natural_w > 320 && natural_w <= 640 && rec_graph_640) {
                             target_w = 640;
                             target_graph = rec_graph_640;
+                        } else if (natural_w > 640 && natural_w <= 1280 && rec_graph_1280) {
+                            target_w = 1280;
+                            target_graph = rec_graph_1280;
                         }
 
-                        if (!target_graph) target_graph = rec_graph_320 ? rec_graph_320 : (rec_graph_160 ? rec_graph_160 : rec_graph_640);
+                        if (!target_graph) target_graph = rec_graph_320 ? rec_graph_320 : (rec_graph_160 ? rec_graph_160 : (rec_graph_640 ? rec_graph_640 : rec_graph_1280));
                         if (!target_graph) continue;
 
                         ppocr::ImageBGR padded_crop;

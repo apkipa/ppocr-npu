@@ -571,9 +571,59 @@ W=512 是粗扫点估计最高值，但只比 W=480 高约 1.0%。随后对 W=43
 
 ![Rec static-width NPU latency](assets/rec-width-latency.svg)
 
-图中蓝线为 P50，浅蓝带为 P10--P90；红点标出当前工程基线宽度 `W160/W320/W640`。这是单请求 NPU 图延迟，不是设备峰值 TOPS 或 C++ 端到端 OCR 延迟。
+图中蓝线为 P50，浅蓝带为 P10--P90；红点标出旧基线微基准宽度 `W160/W320/W640`。当前运行时另有 W1280 桶。这些数值是单请求 NPU 图延迟，不是设备峰值 TOPS 或 C++ 端到端 OCR 延迟。
 
-这些宽图是静态宽桶的 NPU 图延迟，不是 C++ CLI 端到端延迟；当前 C++ 对 `W>640` 仍使用 W640 滑窗。原始 JSONL：`Z:\TEMP\rec_width_sweep_single_duration_20260929.txt`，控制台日志：`Z:\TEMP\rec_width_sweep_single_duration_console_20260929.txt`。
+这些宽图是静态宽桶的 NPU 图延迟，不是 C++ CLI 端到端延迟；当前 C++ 对 `640<W<=1280` 使用 W1280 单桶，`W>1280` 仍使用 W640 滑窗。原始 JSONL：`Z:\TEMP\rec_width_sweep_single_duration_20260929.txt`，控制台日志：`Z:\TEMP\rec_width_sweep_single_duration_console_20260929.txt`。
+
+### W1280 桶的常驻内存
+
+使用 `Z:\TrustedSpace\01.png` 执行 `ppocr_npu.exe --profile`。程序按 Det、Rec160、Rec320、Rec640、Rec1280 顺序加载模型，每步同时采样 Level Zero context DDR 与 Windows 进程内存；请求池深度为 2。W1280 使用共享 Rec shape template 填充到 `1x3x48x1280`，输出序列长度为 160。
+
+热加载（第二次进程，命中本项目 NATIVE blob cache）在 W1280 前后的快照：
+
+| 指标 | W640 后 | W1280 后 | W1280 增量 |
+|---|---:|---:|---:|
+| NPU context DDR allocated | 208,216 KB | 235,644 KB | **27,428 KB / 26.8 MiB** |
+| 进程 Working Set | 143,796 KB | 162,852 KB | **19,056 KB / 18.6 MiB** |
+| 进程 Private Bytes | 68,924 KB | 70,052 KB | **1,128 KB / 1.1 MiB** |
+
+冷首轮 W1280 编译耗时约 1.47 s；首轮加载后进程快照相对 W640 后增加 Working Set 67,616 KB、Private Bytes 37,660 KB。该冷态增量包含驱动 JIT 和文件映射，不应当作稳定的模型专属常驻内存。表中的 NPU 数字来自 `ZE_GRAPH_QUERY_MEMORY_DDR`，是整个 Level Zero context 的 DDR 分配快照，阶段差值用于估计新图及其请求池的增量；它不是 CMX 使用量，也不包含瞬时峰值。Windows Working Set 会包含驻留的映射页面，Private Bytes 表示进程私有提交量，两者不能相加后当作机器总物理占用。
+
+### LZ4 压缩 blob 的热加载 A/B
+
+对同一批已编译 NATIVE ELF blob 做 C++ Level Zero 加载 A/B：基线是原始 `.blob` 通过只读 mmap 交给 `zeGraphCreate2`；实验路径是普通 `ifstream` 读取同盘 `.lz4b`，用 LZ4 block 解压到连续缓冲区，再交给相同的 `zeGraphCreate2`/graph initialize。压缩块前有 24-byte 实验头保存 magic、原始长度和压缩长度。两种路径均使用同一个缓存中的原始 NATIVE blob、相同图参数与两个请求的 request pool；C++ `--profile` 外层加载计时覆盖了文件读取、LZ4 DLL `LoadLibrary`、解压、graph create/init 和 request pool。
+
+| 模型 | 原始 blob | LZ4 block 文件 | 原始 mmap `load_model` P50 | 普通读取 + LZ4 `load_model` P50 | 差值 |
+|---|---:|---:|---:|---:|---:|
+| Rec1280 | 12,283,304 B | 10,279,065 B（缩小 16.3%） | 14.55 ms | 21.64 ms | LZ4 慢 7.09 ms |
+| Det960 | 45,516,536 B | 8,277,681 B（缩小 81.8%） | 47.73 ms | 50.05 ms | LZ4 慢 2.31 ms |
+
+每条路径各运行 3 次，表中取中位数；这组是同盘、重复运行的热加载测试，没有清空 Windows 文件缓存。LZ4 仍能显著缩小 Det blob，但本测试没有缩短完整模型加载时间；Rec1280 的压缩率较低，额外读取缓冲区、解压和内存写入使总加载更慢。该结果不能外推到冷盘启动。
+
+`LZ4/read-loaded` 子日志的图创建/初始化计时不含压缩文件读取、`LoadLibrary` 或解压；A/B 结论只使用 `load_profiled` 的外层总加载时间，DLL 初始化已计入该总数，但没有单独拆项。本实验没有采集硬/软 page-fault 计数，因此不能用这些墙钟差断言 mmap 或 LZ4 触发了多少 fault。LZ4 路径还要写入完整的解压缓冲区，随后驱动再消费该 NATIVE blob；压缩减少的是文件字节数，不会省去原始图数据的内存访问。
+
+### Zstd 长距离窗口的 Rec 多 blob 打包实验
+
+前面的 LZ4 A/B 是单个 blob；另外对四个 Rec NATIVE blob（W160/320/640/1280，原始合计 **48,644,376 B**）做了打包压缩实验。压缩等级固定为 Zstd 最低等级 `-1`、单线程；“独立”是四个文件分别压缩后求和，“拼接”是先按 W1280/W160/W320/W640 顺序串成一个输入流。`--long=25` 把 Zstd 的匹配窗口扩展到约 32 MiB，使它能引用前一个 blob 中相隔数 MB 的相同 `.data.ConstIO` 区段。
+
+| 方案 | 压缩后大小 | 相对原始 | 说明 |
+|---|---:|---:|---|
+| 四个 blob 独立 `zstd -1` | 36,769,860 B | -24.4% | 跨文件重复无法利用 |
+| 拼接后 `zstd -1`（默认窗口） | 36,760,358 B | -24.4% | 比独立压缩只少 9,502 B |
+| 拼接后 `zstd -1 --long=25` | **12,243,617 B** | **-74.8%** | 利用跨 blob 长距离重复 |
+
+`--long=25` 压缩流通过 `zstd -t` 完整性检查；解压后的 48,644,376 B 与原始拼接流 SHA-256 一致。热文件缓存下各跑 5 次（首轮丢弃）的 CLI 墙钟 P50 为：
+
+| 操作 | 默认窗口 | `--long=25` | 差异 |
+|---|---:|---:|---:|
+| 压缩 | 78.8 ms | 104.0 ms | +25.2 ms（约 +32%） |
+| 解压到文件 | 67.0 ms | 67.0 ms | 基本相同 |
+
+1 ms 轮询得到的进程内存采样峰值约为：压缩默认窗口 5.9 MiB、长窗口 39.5 MiB；解压默认窗口 5.6 MiB、长窗口 37.2 MiB。因此长窗口主要代价是约 **32--34 MiB** 的额外工作集/私有内存，而不是解压时间。该内存数字是 Windows 进程采样值，不是驱动 NPU DDR 或稳定驻留量。
+
+为和当前未压缩基线对比，又测了原始拼接文件直接 `File.ReadAllBytes` 以及 Zstd 解压到内存管道：原始读取 P50 **19.8 ms**，默认窗口固实流 **50.0 ms**，`--long=25` 固实流 **49.2 ms**。因此在热缓存、只看“文件读入/解压”的微基准中，压缩流比未压缩多约 **29--30 ms**；冷盘时少读 11.9 MB（默认窗口）或 36.4 MB（长窗口）可能抵消部分解压开销，但本实验没有清空系统文件缓存，不能外推冷盘结论。
+
+该方案适合“多个 Rec 桶一起发布/加载”的打包格式；它不能直接替代每个 `.blob` 的独立 mmap：要取中间桶，解码器通常需要从流起点顺序解压到对应边界，除非额外建立 Zstd seekable frame/检查点。长窗口只减少磁盘包大小，不改变驱动最终消费的 NATIVE blob 大小，也不会让单个桶的 `zeGraphCreate2` 初始化自动变快。
 
 #### 相同总时间步下的 batch 慢点根因
 

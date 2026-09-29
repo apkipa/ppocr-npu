@@ -14,8 +14,8 @@
 - **2-请求 CPU-NPU 异步双缓冲流水线（Ping-Pong Pipeline）**：在 NPU 完整推理请求仍串行执行的前提下，让主机侧的裁剪、归一化与 CTC 解码和 NPU 执行重叠，填补 CPU-NPU 之间的流水气泡；单行均摊吞吐量达到 **475 FPS（短文本桶高达 581 FPS）**。
 - **默认 960 整图检测**：按比例缩放输入，使长边不超过 960，再送入 `960×960` Det 图；可用 `--det-mode tile --tile-size <n>` 切换为固定尺寸 tile 检测。
 - **概率图 tile 拼接**：显式 tile 模式的重叠区域采用逐像素 `max`，并可用 `--det-heatmap-dir` 导出每个 tile 与拼接热力图；切片边界与后处理仍需单独评估。
-- **识别静态桶路由**：按文本框归一化后的自然宽度选择静态 Rec 图；桶宽必须同时满足像素宽度和 CTC 时间步容量，当前 `160/320/640` 仅是历史基线，不代表最终桶配置。
-- **端到端微秒级性能剖析（`--profile` 开关）**：内建全链路各阶段高精度打点器，清晰打印图像解码、切片提取、Det 推理、DBNet 后处理、Rec 推理及 CTC 解码的耗时账单。
+- **识别静态桶路由**：按文本框归一化后的自然宽度选择 `160/320/640/1280` Rec 图；超过 1280 px 的行仍使用 W640 滑窗。
+- **端到端性能剖析（`--profile`）**：输出各阶段耗时、进程 Working Set/Private Bytes，以及每次模型加载后的 NPU DDR context 占用和 W1280 增量。
 
 ---
 
@@ -56,7 +56,7 @@
 # 1. 自动同步依赖环境
 uv sync
 
-# 2. 构建默认 GELU Det 960x960 与 Rec 160/320/640 优化 IR 模型及词表
+# 2. 构建默认 GELU Det 960x960 与 Rec 160/320/640/1280 优化 IR 模型及词表
 uv run python scripts/build_models.py
 ```
 
@@ -65,6 +65,7 @@ uv run python scripts/build_models.py
 - `ppocrv6_small_rec_w160.xml` / `.bin` / `.ngraph_lite`
 - `ppocrv6_small_rec_w320.xml` / `.bin` / `.ngraph_lite`
 - `ppocrv6_small_rec_w640.xml` / `.bin` / `.ngraph_lite`
+- `ppocrv6_small_rec_w1280.xml` / `.bin` / `.ngraph_lite`
 - `ppocr_keys_v1.txt`（包含 18,709 个字符的完整多语种字典）
 
 > **注**：无需手动存放硬件二进制 Blob。首次运行 C++ 引擎时，驱动将自动执行 JIT 编译并缓存至 `cache/<model_name>.blob`，后续运行 0.2ms 自动秒开。
@@ -117,6 +118,7 @@ cmake --build build --config Release
 | `--rec-model-160 <path>` | 短词识别模型路径 ($W=160$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
 | `--rec-model-320 <path>` | 标准识别模型路径 ($W=320$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
 | `--rec-model-640 <path>` | 长句识别模型路径 ($W=640$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
+| `--rec-model-1280 <path>` | 超宽文本识别模型路径 ($W=1280$)，默认从模板填充形状 | `models/ppocrv6_small_rec_template.xml` |
 | `--dictionary <path>` | 字符映射字典文件路径 | `models/ppocr_keys_v1.txt` |
 | `--rec-scheduling <mode>` | 识别请求调度：`round-robin` 固定轮转或 `poll` 轮询已完成请求；`poll` 仅支持在途数为 2 | `round-robin` |
 | `--rec-inflight <n>` | 每个识别模型同时在途的请求数（1 到 8）；使用 `poll` 时必须为 2 | `2` |
@@ -168,9 +170,17 @@ Rec 路由使用裁剪框在高度 48 px 下的自然宽度。不同数据源分
 
 像素宽度还不是唯一约束。Rec 的 CTC 时间步为 `T=W/8`，例如 `W96/128/160` 分别只有 12/16/20 步；PaddleX 验证集里，字符数超过这些容量的比例分别为 0.58%、0.10%、0.05%。因此桶选择必须同时检查自然宽度和字符容量，不能把 `W160` 当固定短桶起点，也不能仅凭像素分布决定最终配置。
 
-完整的 `W32..W2752` NPU 宽度曲线已记录在优化报告。该曲线使用每宽度独立进程、编译后按墙钟预热 2 秒、再采样 30 次的协议；曲线总体随宽度增长，但受 compiler shape/tiling 和 DVFS 影响存在局部台阶与离散。当前 C++ 的 `W>640` 仍走 W640 滑窗，宽静态图测试不能直接当作现有端到端延迟。
+完整的 `W32..W2752` NPU 宽度曲线已记录在优化报告。该曲线使用每宽度独立进程、编译后按墙钟预热 2 秒、再采样 30 次的协议；曲线总体随宽度增长，但受 compiler shape/tiling 和 DVFS 影响存在局部台阶与离散。当前 `640 < W <= 1280` 路由到 W1280；`W>1280` 仍走 W640 滑窗，因此更宽静态图测试不能直接当作现有端到端延迟。
 
 ![Rec 静态宽度 NPU 延迟曲线](docs/assets/rec-width-latency.svg)
+
+### W1280 常驻内存测量
+
+对 `Z:\TrustedSpace\01.png` 运行 `build\Release\ppocr_npu.exe --image Z:\TrustedSpace\01.png --profile`。第二次（命中项目 blob cache）加载时，W1280 使 NPU context DDR allocated 从 208,216 KB 增至 235,644 KB，增量 **27,428 KB（26.8 MiB）**。同一时点的进程 Working Set 从 143,796 KB 增至 162,852 KB（**+18.6 MiB**），Private Bytes 从 68,924 KB 增至 70,052 KB（**+1.1 MiB**）。冷加载的图编译约 1.47 s；首次进程在加载后观测到的 Working Set/Private Bytes 增量分别为 66.0/36.8 MiB，包含冷编译和映射页面，不代表 W1280 的热态独占常驻量。NPU 数字是 Level Zero graph-extension 的 context DDR 查询，不是 CMX 用量；各数值均为模型加载后的进程快照，不是峰值。
+
+另测了原始 mmap 与普通读取 LZ4 NATIVE blob 的热加载：Rec1280 的 `load_model` P50 为 14.55/21.64 ms，Det960 为 47.73/50.05 ms。LZ4 缩小了文件，但这组未清空系统文件缓存的实测没有变快；page-fault 数未采集，细节见优化报告。
+
+对四个 Rec NATIVE blob 做了 Zstd `-1` 固实打包实验：原始合计 48,644,376 B，默认窗口压到 36,760,358 B（节省 24.43%），`--long=25`（约 32 MiB 长距离窗口）压到 **12,243,617 B**（节省 74.83%）。热缓存微基准中，原始 `File.ReadAllBytes` P50 为 19.8 ms，固实流解压到内存管道为 50.0/49.2 ms（默认/长窗口），即压缩路径多约 29--30 ms；冷盘未测。长窗口额外进程内存约 32--34 MiB。它适合多个 Rec 桶合并发布，但不具备单个桶直接 mmap 的随机访问特性；完整数据和边界见优化报告。
 
 ---
 

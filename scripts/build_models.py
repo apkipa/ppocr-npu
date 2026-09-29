@@ -10,7 +10,7 @@ Applies the following optimizations:
     - Builds the default 960x960 detection graph; 640x640 remains available for fixed-size tiling
     - Pure FP16 port unification (ConvertFP32ToFP16)
 - Recognition (Rec):
-    - Multi-bucket static shapes: W=160 (short words), W=320 (standard sentences), W=640 (long sentences)
+    - Multi-bucket static shapes: W=160/320/640/1280 for short words through wide text lines
     - V1: Pure FP16 & Constant Folding (cures NPU hardware FTZ NaN bug at Sqrt.8)
     - V2: MOC GELU fusion
     - V3: Softmax removal at final classification head (eliminates 476us serial SHAVE stall)
@@ -197,7 +197,7 @@ def main():
                         help="Detection resolution (default 960 for the default whole-image resize path)")
     parser.add_argument("--det-relu-mul7", action="store_true",
                         help="Opt in to the validated but non-equivalent Mul.7 GELU->ReLU rewrite (640x640 only)")
-    parser.add_argument("--rec-widths", nargs="+", type=int, default=[160, 320, 640], help="Recognition width buckets")
+    parser.add_argument("--rec-widths", nargs="+", type=int, default=[160, 320, 640, 1280], help="Recognition width buckets")
     parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries for NPU")
     parser.add_argument("--no-templates", action="store_true", help="Skip shape template generation (.xml/.bin/.ngraph_lite)")
     args = parser.parse_args()

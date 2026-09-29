@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -193,7 +194,7 @@ public:
 
     // Prints active NPU/context allocation usage. Cache statistics are separate
     // because querying them can scan driver-managed cache state.
-    void print_memory_usage(const char* tag = "");
+    std::optional<uint64_t> print_memory_usage(const char* tag = "");
 
     // Prints driver/program cache statistics. This is diagnostic-only and is
     // intentionally not part of the normal inference profile.
