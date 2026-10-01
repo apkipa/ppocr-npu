@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import openvino as ov
-import openvino.runtime.passes as passes
+import openvino.passes as passes
 from openvino.preprocess import ColorFormat, PrePostProcessor
 
 
@@ -229,11 +229,15 @@ def main():
                         help="Detection resolution (default 960 for the default whole-image resize path)")
     parser.add_argument("--det-relu-mul7", action="store_true",
                         help="Opt in to the validated but non-equivalent Mul.7 GELU->ReLU rewrite (640x640 only)")
-    parser.add_argument("--det-input-u8", action="store_true",
-                        help="Experimental Det input: BGR/NHWC U8 with model-side preprocessing")
+    parser.add_argument("--det-input-u8", dest="det_input_u8", action="store_true", default=True,
+                        help="Build the default Det BGR/NHWC U8 model with model-side preprocessing")
+    parser.add_argument("--no-det-input-u8", dest="det_input_u8", action="store_false",
+                        help="Build the FP16 NCHW Det model instead of U8")
     parser.add_argument("--rec-widths", nargs="+", type=int, default=[160, 320, 640, 1280], help="Recognition width buckets")
-    parser.add_argument("--rec-input-u8", action="store_true",
-                        help="Experimental Rec input: BGR/NHWC U8 with model-side preprocessing")
+    parser.add_argument("--rec-input-u8", dest="rec_input_u8", action="store_true", default=True,
+                        help="Build the default Rec BGR/NHWC U8 models with model-side preprocessing")
+    parser.add_argument("--no-rec-input-u8", dest="rec_input_u8", action="store_false",
+                        help="Build FP16 NCHW Rec models instead of U8")
     parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries for NPU")
     parser.add_argument("--no-templates", action="store_true", help="Skip shape template generation (.xml/.bin/.ngraph_lite)")
     args = parser.parse_args()

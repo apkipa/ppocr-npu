@@ -74,15 +74,15 @@ void print_usage(const char* prog) {
     std::cout << "Options:\n";
     std::cout << "  --image <path>         Path to input image file (JPG, PNG, BMP, TIFF, WebP)\n";
     std::cout << "  --clipboard            Read image directly from Windows Clipboard\n";
-    std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_template.xml]\n";
-    std::cout << "  --det-input-u8         Experimental Det BGR/NHWC U8 input with model-side preprocessing\n";
+    std::cout << "  --det-model <path>     Path to Det model (.xml, .ngraph_lite, or .blob) [default: models/ppocrv6_small_det_u8_template.ngraph_lite]\n";
+    std::cout << "  --no-det-input-u8      Use FP16 NCHW Det input instead of the default BGR/NHWC U8\n";
     std::cout << "  --det-mode <mode>      Detection mode: resize or tile (default resize)\n";
     std::cout << "  --tile-size <n>        Tile edge length in pixels (multiple of 32, 32-960; default 960)\n";
-    std::cout << "  --rec-model-160 <path> Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
-    std::cout << "  --rec-model-320 <path> Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
-    std::cout << "  --rec-model-640 <path> Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
-    std::cout << "  --rec-model-1280 <path> Path to Rec W=1280 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_template.xml]\n";
-    std::cout << "  --rec-input-u8        Experimental Rec BGR/NHWC U8 input with model-side preprocessing\n";
+    std::cout << "  --rec-model-160 <path> Path to Rec W=160 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_u8_template.ngraph_lite]\n";
+    std::cout << "  --rec-model-320 <path> Path to Rec W=320 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_u8_template.ngraph_lite]\n";
+    std::cout << "  --rec-model-640 <path> Path to Rec W=640 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_u8_template.ngraph_lite]\n";
+    std::cout << "  --rec-model-1280 <path> Path to Rec W=1280 model (.xml or .ngraph_lite) [default: models/ppocrv6_small_rec_u8_template.ngraph_lite]\n";
+    std::cout << "  --no-rec-input-u8      Use FP16 NCHW Rec input instead of the default BGR/NHWC U8\n";
     std::cout << "  --dictionary <path>    Path to dictionary [default: models/ppocr_keys_v1.txt]\n";
     std::cout << "  --rec-scheduling <mode> Request selection: round-robin or poll (poll requires inflight=2)\n";
     std::cout << "  --rec-inflight <n>     In-flight requests per recognition graph (default 2, range 1-8)\n";
@@ -142,21 +142,20 @@ int main(int argc, char* argv[]) {
         bool from_clipboard = false;
 
         auto resolve_model = [](const std::string& base_no_ext) -> std::string {
+            if (fs::exists(base_no_ext + ".ngraph_lite")) return base_no_ext + ".ngraph_lite";
             if (fs::exists(base_no_ext + ".xml")) return base_no_ext + ".xml";
             if (fs::exists("cache/" + fs::path(base_no_ext).stem().string() + ".blob")) return "cache/" + fs::path(base_no_ext).stem().string() + ".blob";
             if (fs::exists(base_no_ext + ".blob")) return base_no_ext + ".blob";
-            if (fs::exists(base_no_ext + ".ngraph_lite")) return base_no_ext + ".ngraph_lite";
             return base_no_ext + ".xml";
         };
 
-        std::string det_model = resolve_model("models/ppocrv6_small_det_template");
-        std::string rec_template = resolve_model("models/ppocrv6_small_rec_template");
-        std::string rec_160 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w160");
-        std::string rec_320 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w320");
-        std::string rec_640 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w640");
-        std::string rec_1280 = fs::exists(rec_template) ? rec_template : resolve_model("models/ppocrv6_small_rec_w1280");
-        bool rec_input_u8 = false;
-        bool det_input_u8 = false;
+        bool rec_input_u8 = true;
+        bool det_input_u8 = true;
+        std::string det_model;
+        std::string rec_160;
+        std::string rec_320;
+        std::string rec_640;
+        std::string rec_1280;
         bool det_model_explicit = false;
         bool rec_model_160_explicit = false;
         bool rec_model_320_explicit = false;
@@ -221,8 +220,12 @@ int main(int argc, char* argv[]) {
                 rec_model_1280_explicit = true;
             } else if (arg == "--rec-input-u8") {
                 rec_input_u8 = true;
+            } else if (arg == "--no-rec-input-u8") {
+                rec_input_u8 = false;
             } else if (arg == "--det-input-u8") {
                 det_input_u8 = true;
+            } else if (arg == "--no-det-input-u8") {
+                det_input_u8 = false;
             } else if (arg == "--dictionary") {
                 if (i + 1 >= argc) throw std::invalid_argument("--dictionary requires a path");
                 dict_path = argv[++i];
@@ -279,15 +282,19 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (rec_input_u8) {
-            if (!rec_model_160_explicit) rec_160 = resolve_model("models/ppocrv6_small_rec_u8_template");
-            if (!rec_model_320_explicit) rec_320 = resolve_model("models/ppocrv6_small_rec_u8_template");
-            if (!rec_model_640_explicit) rec_640 = resolve_model("models/ppocrv6_small_rec_u8_template");
-            if (!rec_model_1280_explicit) rec_1280 = resolve_model("models/ppocrv6_small_rec_u8_template");
+        if (!det_model_explicit) {
+            det_model = resolve_model(det_input_u8
+                ? "models/ppocrv6_small_det_u8_template"
+                : "models/ppocrv6_small_det_template");
         }
-        if (det_input_u8 && !det_model_explicit) {
-            det_model = resolve_model("models/ppocrv6_small_det_u8_template");
-        }
+        const std::string rec_template = resolve_model(rec_input_u8
+            ? "models/ppocrv6_small_rec_u8_template"
+            : "models/ppocrv6_small_rec_template");
+        const std::string rec_prefix = rec_input_u8 ? "models/ppocrv6_small_rec_u8_w" : "models/ppocrv6_small_rec_w";
+        if (!rec_model_160_explicit) rec_160 = fs::exists(rec_template) ? rec_template : resolve_model(rec_prefix + "160");
+        if (!rec_model_320_explicit) rec_320 = fs::exists(rec_template) ? rec_template : resolve_model(rec_prefix + "320");
+        if (!rec_model_640_explicit) rec_640 = fs::exists(rec_template) ? rec_template : resolve_model(rec_prefix + "640");
+        if (!rec_model_1280_explicit) rec_1280 = fs::exists(rec_template) ? rec_template : resolve_model(rec_prefix + "1280");
 
         if (tile_size_explicit && det_mode != DetMode::Tile)
             throw std::invalid_argument("--tile-size requires --det-mode tile");
