@@ -447,6 +447,33 @@ CtcDecoder::CtcDecoder(const std::string& dict_path) {
     std::cout << "[+] Loaded character dictionary: " << dict_.size() << " symbols.\n";
 }
 
+namespace {
+
+template <typename Index>
+std::string decode_ctc_indices(const std::vector<std::string>& dict, const Index* data,
+                               const uint16_t* max_values, int seq_len, float& out_conf) {
+    std::string text;
+    int64_t prev_idx = -1;
+    float conf_sum = 0.0f;
+    int char_count = 0;
+    for (int t = 0; t < seq_len; ++t) {
+        const int64_t best_idx = static_cast<int64_t>(data[t]);
+        if (best_idx != 0 && best_idx != prev_idx && best_idx > 0 &&
+            static_cast<uint64_t>(best_idx - 1) < dict.size()) {
+            text += dict[static_cast<size_t>(best_idx - 1)];
+            if (max_values) {
+                conf_sum += fp16_to_float(max_values[t]);
+                ++char_count;
+            }
+        }
+        prev_idx = best_idx;
+    }
+    out_conf = char_count > 0 ? conf_sum / char_count : 0.0f;
+    return text;
+}
+
+} // namespace
+
 std::string CtcDecoder::decode(const uint16_t* data_fp16, int seq_len, int vocab_size, float& out_conf) const {
     std::string text;
     int prev_idx = -1;
@@ -481,6 +508,19 @@ std::string CtcDecoder::decode(const uint16_t* data_fp16, int seq_len, int vocab
 
     out_conf = (char_count > 0) ? (conf_sum / char_count) : 0.0f;
     return text;
+}
+
+std::string CtcDecoder::decode_indices(const int32_t* data, int seq_len, float& out_conf) const {
+    return decode_ctc_indices(dict_, data, nullptr, seq_len, out_conf);
+}
+
+std::string CtcDecoder::decode_indices(const int32_t* data, const uint16_t* max_values,
+                                       int seq_len, float& out_conf) const {
+    return decode_ctc_indices(dict_, data, max_values, seq_len, out_conf);
+}
+
+std::string CtcDecoder::decode_indices(const int64_t* data, int seq_len, float& out_conf) const {
+    return decode_ctc_indices(dict_, data, nullptr, seq_len, out_conf);
 }
 
 } // namespace ppocr

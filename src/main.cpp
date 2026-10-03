@@ -93,6 +93,7 @@ void print_usage(const char* prog) {
     std::cout << "  --trace <path>         Export host/NPU task timeline as Chrome Trace JSON\n";
     std::cout << "  --trace-mode <mode>    Trace detail: tasks or timestamps (default tasks)\n";
     std::cout << "  --trace-raw-dir <path> Dump RAW profiles and profiled graph blobs (tasks mode only)\n";
+    std::cout << "  --rec-dump-dir <path>  Dump completed W640 Rec inputs/outputs for diagnostics\n";
     std::cout << "  --det-heatmap-dir <path>  Save detector probability heatmap as PGM (diagnostic)\n";
     std::cout << "  --cache-stats          Print driver/program cache statistics (slow diagnostic query)\n";
     std::cout << "  --help                 Show this help message\n";
@@ -164,6 +165,7 @@ int main(int argc, char* argv[]) {
         std::string dict_path = "models/ppocr_keys_v1.txt";
         std::string trace_path;
         std::string trace_raw_dir;
+        std::string rec_dump_dir;
         std::string det_heatmap_dir;
         bool task_trace = true;
         bool rec_poll = false;
@@ -229,6 +231,9 @@ int main(int argc, char* argv[]) {
             } else if (arg == "--dictionary") {
                 if (i + 1 >= argc) throw std::invalid_argument("--dictionary requires a path");
                 dict_path = argv[++i];
+            } else if (arg == "--rec-dump-dir") {
+                if (i + 1 >= argc) throw std::invalid_argument("--rec-dump-dir requires a path");
+                rec_dump_dir = argv[++i];
             } else if (arg == "--rec-scheduling") {
                 if (i + 1 >= argc) throw std::invalid_argument("--rec-scheduling requires 'round-robin' or 'poll'");
                 const std::string value = argv[++i];
@@ -305,6 +310,7 @@ int main(int argc, char* argv[]) {
             throw std::invalid_argument("--trace-mode requires --trace");
         if (!trace_raw_dir.empty() && !task_trace)
             throw std::invalid_argument("--trace-raw-dir requires --trace-mode tasks");
+        if (!rec_dump_dir.empty()) fs::create_directories(rec_dump_dir);
         if (rec_poll && rec_depth != 2)
             throw std::invalid_argument("--rec-scheduling poll requires --rec-inflight 2");
 
@@ -408,6 +414,16 @@ int main(int argc, char* argv[]) {
                           << ", args=" << stats.argument_query_ms
                           << ", request_pool=" << stats.request_pool_ms
                           << ", requests=" << requests << ")\n";
+                for (size_t i = 0; i < graph->outputs().size(); ++i) {
+                    const auto& output = graph->outputs()[i];
+                    std::cout << "[profile] " << label << " output[" << i << "] name=" << output.name
+                              << " precision=" << static_cast<int>(output.precision) << " dims=";
+                    for (size_t d = 0; d < output.dims.size(); ++d) {
+                        if (d) std::cout << 'x';
+                        std::cout << output.dims[d];
+                    }
+                    std::cout << " bytes=" << output.total_bytes << "\n";
+                }
             }
             return graph;
         };
@@ -751,15 +767,69 @@ int main(int argc, char* argv[]) {
                     ppocr::TextBox* box = nullptr;
                     int vocab_size = 0;
                     int valid_seq_len = 0;
+                    int graph_width = 0;
+                    ze_graph_argument_precision_t output_precision = ZE_GRAPH_ARGUMENT_PRECISION_UNKNOWN;
                 };
                 std::vector<PendingRec> pending(static_cast<size_t>(rec_depth));
+                size_t rec_dump_count = 0;
+
+                auto dump_rec_request = [&](ppocr::NpuInferRequest& req, int width) {
+                    if (rec_dump_dir.empty() || width != 640) return;
+                    const std::string prefix = (fs::path(rec_dump_dir) /
+                        ("rec640_" + std::to_string(rec_dump_count++))).string();
+                    auto write_bytes = [](const fs::path& path, const void* data, size_t size) {
+                        std::ofstream file(path, std::ios::binary);
+                        if (!file || !file.write(static_cast<const char*>(data),
+                                                 static_cast<std::streamsize>(size))) {
+                            throw std::runtime_error("Failed to write Rec diagnostic dump: " + path.string());
+                        }
+                    };
+                    write_bytes(prefix + "_input.u8", req.get_input_ptr(), req.get_input_size());
+                    write_bytes(prefix + "_output.bin", req.get_output_ptr(), req.get_output_size());
+                };
+
+                auto is_index_precision = [](ze_graph_argument_precision_t precision) {
+                    return precision == ZE_GRAPH_ARGUMENT_PRECISION_INT32 ||
+                           precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64;
+                };
+                auto rec_vocab_size = [&](const ppocr::TensorDesc& output, int seq_len) {
+                    if (output.precision == ZE_GRAPH_ARGUMENT_PRECISION_FP16) {
+                        const size_t row_bytes = static_cast<size_t>(seq_len) * sizeof(uint16_t);
+                        if (row_bytes == 0 || output.total_bytes % row_bytes != 0) {
+                            throw std::runtime_error("Rec FP16 output size is not divisible by its sequence length");
+                        }
+                        return static_cast<int>(output.total_bytes / row_bytes);
+                    }
+                    if (is_index_precision(output.precision)) {
+                        return static_cast<int>(ctc_decoder.vocab_size());
+                    }
+                    throw std::runtime_error("Unsupported Rec output precision for CTC decoding");
+                };
+                auto decode_rec_output = [&](const void* output, ze_graph_argument_precision_t precision,
+                                             int seq_len, int vocab_size, float& confidence) {
+                    if (precision == ZE_GRAPH_ARGUMENT_PRECISION_FP16) {
+                        return ctc_decoder.decode(static_cast<const uint16_t*>(output), seq_len,
+                                                  vocab_size, confidence);
+                    }
+                    if (precision == ZE_GRAPH_ARGUMENT_PRECISION_INT32) {
+                        return ctc_decoder.decode_indices(static_cast<const int32_t*>(output),
+                                                          seq_len, confidence);
+                    }
+                    if (precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64) {
+                        return ctc_decoder.decode_indices(static_cast<const int64_t*>(output),
+                                                          seq_len, confidence);
+                    }
+                    throw std::runtime_error("Unsupported Rec output precision for CTC decoding");
+                };
 
                 auto consume_rec_slot = [&](size_t slot) {
                     PendingRec& p = pending[slot];
-                    const uint16_t* p_out = reinterpret_cast<const uint16_t*>(p.req->get_output_ptr(0));
+                    dump_rec_request(*p.req, p.graph_width);
                     {
                         ppocr::ScopedTimer timer(metrics.ctc_decode_ms, metrics.trace, "CTC decode");
-                        p.box->text = ctc_decoder.decode(p_out, p.valid_seq_len, p.vocab_size, p.box->text_confidence);
+                        p.box->text = decode_rec_output(p.req->get_output_ptr(0), p.output_precision,
+                                                        p.valid_seq_len, p.vocab_size,
+                                                        p.box->text_confidence);
                     }
                     p.req = nullptr;
                 };
@@ -867,12 +937,15 @@ int main(int argc, char* argv[]) {
                         }
 
                         int seq_len = target_w / 8;
-                        int vocab_size = static_cast<int>(target_graph->outputs()[0].total_bytes / (seq_len * 2));
+                        const auto& output = target_graph->outputs().at(0);
+                        int vocab_size = rec_vocab_size(output, seq_len);
                         pending[slot].req = &req;
                         pending[slot].box = &box;
                         pending[slot].vocab_size = vocab_size;
                         pending[slot].valid_seq_len =
                             std::min(seq_len, static_cast<int>(std::ceil(static_cast<float>(valid_w) / 8.0f)));
+                        pending[slot].graph_width = target_w;
+                        pending[slot].output_precision = output.precision;
                     } else {
                         // Ultra-long lines act as a pipeline barrier: the slice loop
                         // below reuses the 640-graph request slots.
@@ -890,10 +963,24 @@ int main(int argc, char* argv[]) {
                         if (!target_graph) continue;
 
                         int win_cells = win_w / cell_stride; // 80 cells
-                        int vocab_size = static_cast<int>(target_graph->outputs()[0].total_bytes / (win_cells * 2));
+                        const auto& output = target_graph->outputs().at(0);
+                        int vocab_size = rec_vocab_size(output, win_cells);
+                        const bool index_output = is_index_precision(output.precision);
 
-                        // Vector to accumulate merged Logits across slices
-                        std::vector<uint16_t> merged_logits;
+                        // Keep stitched class indices in their graph output width.
+                        std::vector<int32_t> merged_indices32;
+                        std::vector<int64_t> merged_indices64;
+                        std::vector<uint16_t> merged_max_values;
+                        if (index_output) {
+                            if (output.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64) {
+                                merged_indices64.reserve(static_cast<size_t>(num_slices) * win_cells);
+                            } else {
+                                merged_indices32.reserve(static_cast<size_t>(num_slices) * win_cells);
+                            }
+                        } else {
+                            merged_indices32.reserve(static_cast<size_t>(num_slices) * win_cells);
+                            merged_max_values.reserve(static_cast<size_t>(num_slices) * win_cells);
+                        }
 
                         for (int s = 0; s < num_slices; ++s) {
                             int sx = s * step_px;
@@ -938,33 +1025,62 @@ int main(int argc, char* argv[]) {
                                 req.wait();
                             }
 
-                            const uint16_t* p_slice_out = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+                            dump_rec_request(req, win_w);
+
                             int valid_slice_cells = std::min(win_cells, static_cast<int>(std::ceil(static_cast<float>(valid_slice_w) / cell_stride)));
 
-                            // Merge slice into merged_logits using Midpoint Split rule
+                            // Keep only per-frame winners after the midpoint split; the full vocabulary is never stitched.
                             int cell_start = (s == 0) ? 0 : half_overlap_cells;
                             int cell_end = (s == num_slices - 1) ? valid_slice_cells : (win_cells - half_overlap_cells);
 
+                            ppocr::ScopedTimer merge_timer(metrics.rec_grid_output_merge_ms);
                             if (cell_end > cell_start) {
-                                size_t offset_cells = cell_start;
-                                size_t count_cells = cell_end - cell_start;
-                                size_t copy_elems = count_cells * vocab_size;
-
-                                size_t curr_sz = merged_logits.size();
-                                merged_logits.resize(curr_sz + copy_elems);
-                                std::memcpy(
-                                    merged_logits.data() + curr_sz,
-                                    p_slice_out + offset_cells * vocab_size,
-                                    copy_elems * sizeof(uint16_t)
-                                );
+                                if (!index_output) {
+                                    const auto* p_slice_out = static_cast<const uint16_t*>(req.get_output_ptr(0));
+                                    for (int t = cell_start; t < cell_end; ++t) {
+                                        const uint16_t* step = p_slice_out + static_cast<size_t>(t) * vocab_size;
+                                        int best_idx = 0;
+                                        float best_val = -1e9f;
+                                        for (int c = 0; c < vocab_size; ++c) {
+                                            const float value = ppocr::fp16_to_float(step[c]);
+                                            if (value > best_val) {
+                                                best_val = value;
+                                                best_idx = c;
+                                            }
+                                        }
+                                        merged_indices32.push_back(best_idx);
+                                        merged_max_values.push_back(step[best_idx]);
+                                    }
+                                } else if (output.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64) {
+                                    const auto* p_slice_out = static_cast<const int64_t*>(req.get_output_ptr(0));
+                                    merged_indices64.insert(merged_indices64.end(), p_slice_out + cell_start,
+                                                            p_slice_out + cell_end);
+                                } else {
+                                    const auto* p_slice_out = static_cast<const int32_t*>(req.get_output_ptr(0));
+                                    merged_indices32.insert(merged_indices32.end(), p_slice_out + cell_start,
+                                                            p_slice_out + cell_end);
+                                }
                             }
                         }
 
-                        // Run single CTC decode on the merged Logits
-                        int total_seq_len = static_cast<int>(merged_logits.size() / vocab_size);
+                        int total_seq_len = output.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64
+                            ? static_cast<int>(merged_indices64.size())
+                            : static_cast<int>(merged_indices32.size());
                         {
                             ppocr::ScopedTimer timer(metrics.ctc_decode_ms, metrics.trace, "CTC decode");
-                            box.text = ctc_decoder.decode(merged_logits.data(), total_seq_len, vocab_size, box.text_confidence);
+                            if (output.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT64) {
+                                box.text = ctc_decoder.decode_indices(merged_indices64.data(), total_seq_len,
+                                                                      box.text_confidence);
+                            } else if (output.precision == ZE_GRAPH_ARGUMENT_PRECISION_INT32) {
+                                box.text = ctc_decoder.decode_indices(merged_indices32.data(), total_seq_len,
+                                                                      box.text_confidence);
+                            } else if (!index_output) {
+                                box.text = ctc_decoder.decode_indices(merged_indices32.data(),
+                                                                      merged_max_values.data(), total_seq_len,
+                                                                      box.text_confidence);
+                            } else {
+                                throw std::runtime_error("Unsupported Rec output precision for grid CTC decoding");
+                            }
                         }
                     }
                 }

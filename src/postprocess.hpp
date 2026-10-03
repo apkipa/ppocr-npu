@@ -56,6 +56,10 @@ public:
 
     // Greedy decode from unnormalized Logits or Softmax probabilities
     std::string decode(const uint16_t* data_fp16, int seq_len, int vocab_size, float& out_conf) const;
+    std::string decode_indices(const int32_t* data, int seq_len, float& out_conf) const;
+    std::string decode_indices(const int32_t* data, const uint16_t* max_values,
+                               int seq_len, float& out_conf) const;
+    std::string decode_indices(const int64_t* data, int seq_len, float& out_conf) const;
 
     size_t vocab_size() const { return dict_.size() + 1; } // +1 for blank at index 0
 

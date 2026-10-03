@@ -23,6 +23,7 @@ struct TensorDesc {
     std::string name;
     std::vector<uint32_t> dims;
     size_t total_bytes = 0;
+    ze_graph_argument_precision_t precision = ZE_GRAPH_ARGUMENT_PRECISION_UNKNOWN;
     bool is_input = true;
 };
 

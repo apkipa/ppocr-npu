@@ -92,24 +92,23 @@ $$\text{std} = \sqrt{\text{variance} + \epsilon}$$
 
 ## 三、 NPU 存储微架构剖析：片外 DRAM 与片上 SRAM（CMX）
 
-常有人误以为“NPU 既然走 USM 共享内存，那主要用的就是主板内存（DDR5）”。**这是对专用加速器硬件微架构的严重误解**。
+USM/共享内存描述的是主机与设备可访问的内存模型，不代表 NPU 每次运算都直接从主机 DDR 取数；编译后的图可能通过 DMA 在外部内存和片上存储之间搬运数据。但仅凭共享内存分配量，不能推导 CMX 驻留率或实际带宽。
 
 ### 1. 物理层级对比
-* **片外 DRAM（Host DDR5）**：带宽约 70~100 GB/s，延迟 ~100ns，每比特功耗极高（50~100 pJ/bit）；
-* **片上 SRAM（NPU CMX）**：带宽 **> 1,000 GB/s (1 TB/s+)**，单时钟周期延迟 (< 1ns)，每比特功耗极低（0.5~1 pJ/bit）。
+* **片外 DRAM（Host DDR5）**：本机为 48 GB DDR5-5600 双通道，理论峰值约 89.6 GB/s；这是按数据率和通道宽度计算的上限，不是本机应用实测值。
+* **片上 SRAM（NPU CMX）**：架构资料中的 TB/s 级数字只能作为理论/设计估值；本机没有直接测量 CMX 裸带宽，不能把它当作这台设备的实测值。延迟、功耗也未在本实验中测量。
 
-### 2. 实测显存分配画像（`NPU_DEVICE_ALLOC_MEM_SIZE`）
+### 2. 驱动报告的 DDR 分配快照
 
 在 NPU3720（双 Tile，共内置 4.0 MB CMX SRAM）上实测分配如下：
 
-| 模型与分辨率 | 静态权重文件大小 | **NPU 驱动总分配显存 (`ALLOC_MEM`)** | **片外主存暂存区 (Scratchpad / Spill)** | 是否溢出片上 4MB SRAM？ |
-| :--- | :---: | :---: | :---: | :---: |
-| **Small Rec (`48×320`)** | **10.53 MB** | **11.51 MB** | **仅 0.98 MB (微乎其微！)** | **❌ 零溢出（100% 片内 SRAM 闭环）** |
-| **Small Det (`640×640`)** | **9.42 MB** | **65.83 MB** | **56.41 MB (权重的 6 倍！)** | **⚠️ 严重溢出（开辟 56MB 外部平铺缓冲）** |
-| **Small Det (`736×736`)** | **9.42 MB** | **88.27 MB** | **78.85 MB (权重的 8.4 倍！)** | **⚠️ 极度溢出（开辟 79MB 外部平铺缓冲）** |
+| 模型与分辨率 | 静态权重文件大小 | **NPU 驱动总分配显存 (`ALLOC_MEM`)** |
+| :--- | :---: | :---: |
+| **Small Rec (`48×320`)** | **10.53 MB** | **11.51 MB** |
+| **Small Det (`640×640`)** | **9.42 MB** | **65.83 MB** |
+| **Small Det (`736×736`)** | **9.42 MB** | **88.27 MB** |
 
-* **Small Rec 极速之谜**：在未启用 task-level profiling 的原始稳态编译路径中，识别网络特征图极小（最大几百 KB），4MB 片上 SRAM 完全装得下，中间变量在片内就地产生并消费，主图 DMA 很少；启用 profiling 后还会看到 profiling/metadata DMA，不能把两种 task 计数混用；
-* **Small Det 溢出代价**：736 分辨率下单层大特征图即达 17.3MB，SRAM 瞬间被击穿，驱动被迫在外部 DDR5 中开辟近 79MB 暂存区，依赖 DMA 拉链式往返切片搬运。**输入由 736 降至 640 可立刻节省 22.4 MB 的内存搬运吞吐，延迟立竿见影暴降 5.8 ms**。
+`ALLOC_MEM` 是 Level Zero/NPU 驱动报告的设备 DDR 分配快照，不是 CMX 用量，也不等于图执行期间实际读写的字节数。静态模型文件大小与该分配量相减，不能得出 Scratchpad/Spill 大小；因此上表只记录分配快照，不据此判断是否溢出 4 MB CMX。模型权重文件大于 CMX 也不代表权重必须同时驻留片上，图可能分块调度。要定量判断 CMX 命中、spill 和内存流量，需要设备级硬件计数器或针对 NPU DDR/CMX 的独立带宽测试；本报告尚无此类测量。
 
 ---
 
@@ -470,6 +469,123 @@ Z 盘，报告中的表格才是长期保留的实验记录。
 | NPU command window P50 | 291.98 ms | 294.09 ms | +2.11 ms（+0.7%） |
 
 这组早期正式四桶 A/B 使用 `poll`/inflight=2，FP16 与 U8 两条路径均为 41 行且文本逐条一致。该轮 trace 曾观察到输入 `reorder_in_0/PermuteQuantize` DMA 事件。后续以三轮静态图 TASK_LEVEL trace 重新核对时，U8 Rec 输入链可见 `Convert_*` 的 DMA 和 SW 事件；因此不能笼统地说图内输入转换全都落在 DMA，也不能从旧 trace 推广为每种宽度和编译产物都无独立 SW task。后续按默认 round-robin 做的整链复测及每宽度任务记录见“Det/Rec U8 对整条 OCR 耗时的影响”。与 SimdPaddleOCR C# 同图结果相比，C# 也得到 41 行，但 C++ 与 C# 文本序列只有 19 个 matching blocks、SequenceMatcher ratio 46.3%；这个残余差异来自现有 C++ 检测后处理、CLS 缺失和框顺序，不是 U8/FP16 路径单独造成的。当前开关仍保持实验性质，不能据此宣称整条 OCR 链已完全对齐官方 PaddleOCR。
+
+### Rec 末端 Softmax：CPU 与 NPU 对照实验
+
+为区分 Softmax 的放置位置，固定 `Z:\TrustedSpace\01.png`、Det/Rec U8 静态桶、`round-robin`/inflight=2，模型热缓存后各运行 5 次。基线是当前“Rec 输出 FP16 logits、CPU 只做 argmax”；NPU 版本是在同一 Rec 图末端恢复最终 Softmax；CPU 版本在 CTC 前计算稳定 Softmax。三种模式均输出 66 行，文本逐行一致。
+
+| 方案 | 端到端 P50 | Post-load pipeline P50 | Rec pipeline P50 | Rec wait P50 | CTC decode P50 |
+|---|---:|---:|---:|---:|---:|
+| FP16 logits + CPU argmax | 958.50 ms | 825.38 ms | 748.24 ms | 439.26 ms | 87.02 ms |
+| CPU Softmax（朴素实现） | 1210.74 ms | 1075.59 ms | 999.81 ms | 425.95 ms | 352.18 ms |
+| CPU Softmax（单次 FP16 转换 + `expf`） | 1152.20 ms | 1017.53 ms | 940.23 ms | 426.23 ms | 289.63 ms |
+| NPU 图内 Softmax | 992.90 ms | 860.48 ms | 783.39 ms | 497.48 ms | 61.18 ms |
+
+CPU 版本的第一轮实现确实偏朴素：每个时间步重复读取/转换 FP16，并用标量指数计算；改为每步只转换一次、复用 FP32 缓冲并使用 `expf` 后，端到端减少约 59 ms，但相对无 Softmax 仍增加约 194 ms。完整 Softmax 必须对每个时间步的 18,710 类计算归一化分母，不能只做 argmax。`rec_depth=2` 只能在 CPU 解码期间让另一个 NPU 请求继续执行，无法把这段计算完全隐藏；实验中 CPU Softmax 的 CTC 增量约 203 ms，而 Rec pipeline 增量约 192 ms，只有约 10 ms 被重叠吸收。
+
+结论是：CPU Softmax 的首版实现偏慢，但即使做了基本优化，仍显著慢于 NPU 图内 Softmax。NPU 版本的临时模型和测试日志保存在 `Z:\TEMP\rec-softmax-npu` 与 `Z:\TEMP\perf-01-recsoft-*`，没有纳入模型发布或源代码提交；实验后的 C++ 解码器已恢复为基线实现。
+
+#### Softmax TASK_LEVEL trace
+
+进一步对同一 `01.png` 做了一轮 TASK_LEVEL trace（每个 Rec 请求都启用 profiling，结果文件为 `Z:\TEMP\trace-softmax-{base,npu}.json`）。Rec command window 的按宽度中位数如下：
+
+| Rec 桶 | 无最终 Softmax | NPU 最终 Softmax | 增量 |
+|---:|---:|---:|---:|
+| W160 | 1.698 ms | 1.886 ms | +0.188 ms |
+| W320 | 2.417 ms | 2.660 ms | +0.244 ms |
+| W640 | 3.699 ms | 4.155 ms | +0.457 ms |
+| W1280 | 7.006 ms | 7.887 ms | +0.881 ms |
+
+按整轮 trace 的事件记录统计，基线 Rec 相关窗口合计约 `500.6 ms`，NPU Softmax 版本约 `555.1 ms`；增量约 `54.6 ms`，与主机 `Rec wait` 的增加方向一致。NPU Softmax 版本新增了大量 `NPU SW` 记录（选定 Rec Softmax 事件约 1,036 条、持续时间合计约 178.1 ms）；这些是跨集群、可重叠的任务记录，不能直接相加成墙钟。基线对应 Rec 主要是 DPU/DMA，Softmax 版本中最终归一化主要落在 SW 路径，说明瓶颈不是输出拷贝，而是 18,710 类上的指数/归约/归一化任务及其调度。W 越大，时间步越多，增量也随之近似增长。该 trace 是单轮诊断样本，事件计数不等于独立算子数，也不作为所有输入的性能保证。
+
+#### Rec 末端后处理四模式对照
+
+为同时测算输出搬运、CPU 解码和图内算子的影响，固定 `Z:\TrustedSpace\01.png`、Det U8 和 Rec U8；Rec 160/320/1280 显式使用同一 U8 shape template，W640 依次使用四种实验图。四种图的主输出分别为 FP16 logits、FP16 Softmax 概率、TopK I32 索引、以及 Softmax 后 TopK I32 索引。每种模式共独立启动整图 14 次，首轮含该模式图的冷加载/JIT 编译，仅作参考；余下 13 次复用图缓存，包含交错顺序复测和最终 I32 host 拼接缓冲版本。每轮均检测到 66 行，四种模式文本序列逐行一致。
+
+| 模式 | Rec 主输出 | 首轮 E2E（仅参考） | 复用图缓存 E2E P50（范围） | Post-load pipeline P50 |
+|---|---|---:|---:|---:|
+| Base | FP16 logits | 6346.95 ms | 956.09 ms (938.98–1128.48) | 822.57 ms |
+| Softmax | FP16 probabilities | 2396.48 ms | 981.13 ms (957.32–1011.48) | 841.18 ms |
+| ArgMax | I32 indices | 1943.89 ms | 745.74 ms (730.46–776.70) | 611.95 ms |
+| Softmax + ArgMax | I32 indices | 2307.37 ms | 797.45 ms (774.02–818.01) | 659.68 ms |
+
+E2E 与 Post-load 指标来自 `--profile` 整图运行；E2E 包含图加载，Post-load 从模型加载完成后计时。W640 device command window 另从 TASK_LEVEL trace 统计 88 个请求的 P50：Base `3.707 ms`、Softmax `4.179 ms`、ArgMax `4.123 ms`、Softmax + ArgMax `4.563 ms`。因此 ArgMax 图的 NPU command 确实慢约 `0.4 ms/请求`，但整图 E2E 仍快约 `208 ms`；不能仅看 NPU command window 判断完整 pipeline。
+
+在 C++ FP16 grid 路径改为逐帧抽取 argmax 后，重新对四种 W640 图各预热 1 次，再交错运行 5 次；160/320/1280 均使用相同的默认 U8 模板，其他参数不变。所有模式均检测到 66 行，带置信度输出逐行一致：
+
+| W640 模式 | 当前 C++ 路径 | E2E P50（范围） | Post-load P50 |
+|---|---|---:|---:|
+| Base | FP16 logits 逐帧 argmax | 769.52 ms (762.82–771.17) | 632.20 ms |
+| Softmax | FP16 probabilities 逐帧 argmax | 784.44 ms (784.07–1020.14) | 648.74 ms |
+| ArgMax | NPU 输出 I32 索引 | 741.72 ms (737.87–746.06) | 601.49 ms |
+| Softmax + ArgMax | NPU 输出 I32 索引 | 777.05 ms (773.06–777.97) | 641.00 ms |
+
+Softmax 模式有 2/5 次 E2E 高于 1 s（对应 Post-load 约 0.87–0.88 s），其余 3 次为 784.07–784.44 ms；本轮未采 TASK_LEVEL trace，不能把这两次波动归因于某个 NPU 操作。表中保留全部样本范围，P50 按 5 次完整运行计算。当前 C++ argmax/stitch 优化同时适用于 Base logits 和 FP16 Softmax 输出；ArgMax 两种模式只拼接类别索引。
+
+随后按相同设置独立重测一轮，仍是每种模式预热 1 次、交错运行 5 次。66 行输出在四种模式间逐行一致；完整日志保存在 `Z:\TEMP\cpp-4way-e2e-rerun-20261003`：
+
+| W640 模式 | E2E P50（范围） | Post-load P50 | Rec pipeline P50 |
+|---|---:|---:|---:|
+| Base | 761.96 ms (756.60–771.71) | 621.68 ms | 560.77 ms |
+| Softmax | 776.90 ms (772.26–786.56) | 639.31 ms | 577.92 ms |
+| ArgMax | 729.21 ms (727.70–731.44) | 593.16 ms | 532.25 ms |
+| Softmax + ArgMax | 773.55 ms (769.47–774.67) | 635.51 ms | 573.41 ms |
+
+本轮 Base 比 ArgMax 慢 `32.75 ms` E2E，Rec pipeline 慢 `28.52 ms`。这不是因为 ArgMax 的 NPU command 更快：TASK_LEVEL trace 中 ArgMax command 反而约多 `0.4 ms/请求`。差别在于 Base 图仍输出 FP16 logits，当前 C++ 必须在每个同步完成的 W640 slice 后扫描 18,710 类，merge/stitch P50 为 `62.23 ms`；NPU ArgMax 图直接输出 I32 类别索引，主机 stitch 约 `0.05 ms`，CTC 索引折叠 P50 为 `22.11 ms`。也就是说，ArgMax 把类别归约从主机移进图中，省下的主机扫描时间超过了图内新增开销；整图输出相同。注意 profile 子计时会受流水线和主机等待影响，不能简单相加为 E2E。
+
+Softmax 与 Softmax + ArgMax 的 E2E P50 只差 `3.35 ms`，且范围重叠；在这组样本中不能据此声称组合图有稳定增速。NPU Softmax+ArgMax 虽省掉主机类别扫描，但需承担图内 ArgMax 的额外 command 成本，二者大致抵消。故 ArgMax 的收益取决于是否替代了关键路径上的主机 argmax，而不是单看 NPU 算子耗时或是否输出了索引。
+
+##### 无 grid 拼接的短图对照
+
+再用 `Z:\TrustedSpace\02.png`（`299×351`，检测 3 行）只替换 W320 图为 Base 或 ArgMax I32 图；160/640/1280 均显式使用相同 U8 template。TASK_LEVEL trace 中只有 3 个 W320 Rec 请求，没有 W640/grid 请求。每种模式交错启动 6 次，排除首轮冷加载后取 5 次 P50：
+
+| 模式 | E2E P50（范围） | Post-load P50 | Rec pipeline wall P50 | CTC P50 | W320 command P50 |
+|---|---:|---:|---:|---:|---:|
+| Base logits | 241.57 ms (240.65–247.54) | 116.06 ms | 23.08 ms | 0.94 ms | 4.702 ms |
+| ArgMax I32 | 244.50 ms (243.22–250.89) | 117.47 ms | 23.98 ms | <0.01 ms | 5.331 ms |
+
+两模式文本逐行一致，但这个无拼接样本里 ArgMax 没有带来 E2E 加速：P50 反而慢 `2.93 ms`，且两组 E2E 范围重叠。该结果和短序列 CTC 仅约 `0.94 ms`、而 NPU TopK command 每请求增加约 `0.63 ms` 一致；不能把有 grid 的长图收益推广到不发生 logits 拼接的场景。
+
+为解释端到端差值，在 C++ profile 中单独计时了超长行 W640 grid 输出拼接。最终 I32 host 缓冲版本做 3 轮交错 profile，组件 P50 为：Base 拼接 `160.46 ms`、CTC `89.36 ms`；ArgMax 拼接 `0.05 ms`、CTC `22.66 ms`；Softmax 拼接 `159.21 ms`、CTC `69.19 ms`；Softmax + ArgMax 拼接 `0.05 ms`、CTC `22.66 ms`。Base/Softmax 需将每个时间步的 18,710 个 FP16 logits 复制进长向量，ArgMax 模式只拼接每步一个 I32 类别 ID，并在 C++ 中保持 I32 存储。Base 到 ArgMax 的拼接与 CTC 组件合计减少约 `227 ms`，整条 Recognition wall 在该三轮诊断中的 P50 减少约 `216 ms`，同时 NPU command 仍慢约 `0.4 ms/请求`。host 拼接、解码、请求等待存在流水线重叠，不能把组件耗时简单相加当作 E2E；独立的 E2E P50 已在上表实测。
+
+#### C++ FP16 logits grid 路径优化
+
+在既有 C++ Base logits 路径上直接优化，而不改变 NPU 图：每个 W640 slice 依 midpoint 规则保留时间步时，立即扫描该步 18,710 个 FP16 类别，只保存 argmax I32 和对应的 FP16 最大 logit；不再扩容/复制整段 logits，也不在 CTC 阶段重复扫描类别轴。CTC 仍在拼接后的完整时间序列上运行，因此重复字符跨 slice 边界仍按全局 CTC 规则折叠；最大 logit 以 FP16 保存并在字符发射时转回 float，维持原有 `text_confidence` 定义。
+
+用 `Z:\TrustedSpace\01.png`、W640 Base 图 `Z:\TEMP\rec-postop-4way\rec_w640_base.ngraph_lite` 对比改动前保存的 Base 日志和改动后 Release 程序。两边检测/识别输出均为 66 行，带置信度的逐行输出完全一致。改动前 4 次热态日志 E2E P50 为 `951.04 ms`（范围 `946.34–954.21 ms`）；改动后独立复测 Base E2E P50 为 `761.96 ms`（5 次，范围 `756.60–771.71 ms`），约减少 `189 ms` / `19.9%`。此为单图本机实测，不外推为普遍收益。
+
+旧 Base 诊断中 grid logits copy/merge 为 `160.46 ms`、CTC 全类别扫描为 `89.36 ms`；新路径 `Rec grid output merge/stitch`（包含 argmax 扫描）P50 为 `62.23 ms`，CTC 索引折叠 P50 为 `26.24 ms`。两项合计由 `249.82 ms` 降至 `88.47 ms`（约 `64.6%`）。注意 merge timer 的工作内容在优化前后不同；新值不是纯 memcpy 时间。这里的收益来自 C++ 避免复制 logits 和二次扫描，不是 NPU ArgMax 算子加速，也不适用于未触发 grid 的短文本。
+
+TASK_LEVEL 事件数也显示末端操作仍分别执行：Softmax-only 相对 Base 新增 704 条 `NPU SW` Softmax 和 704 条 Softmax DMA 记录；ArgMax-only 新增 352 条 `NPU SW` TopK 记录；组合图同时保留这两组增量。事件记录可能对应切片/集群任务，不等于独立算子数，但没有观察到 Softmax 被 ArgMax 消除或两者融合为同一任务。组合模式相对 Base 的 W640 command window 增量约 `0.856 ms`，接近两个单项增量之和。新增的 grid merge profile timer 输出为 `Rec grid output merge/stitch`，只用于定位主机端拼接成本。
+
+索引输出最终改为 I32：TopK 的 `index_element_type` 规范只允许 I32/I64；I64 可用但输出缓冲是 I32 的两倍（W640 单请求 `640 B` 对 `320 B`）。类别索引范围 `0..18709` 虽可放入 U16，OpenVINO TopK 不允许 U16 索引类型；尝试在 TopK 后转换到 U16/I16 时，NPU3720 编译器均拒绝该 Convert 配置，因此当前 NPU 图能直接产生的最小索引类型是 I32。四种主输出图、trace、profile 日志均在 `Z:\TEMP\rec-postop-4way`。
+
+#### TopK 同时输出最大值和索引
+
+在 W640 Base logits 图末端追加沿类别轴的 `TopK(k=1)`，分别编译“只暴露 indices”和“同时暴露 values + indices”两张图。OpenVINO 2026.4 NPU 插件两图均编译、推理成功；双输出分别为 FP16 最大 logit `[1,80,1]` 和 I32 索引 `[1,80,1]`。
+
+每图预热 5 次后，交错执行 30 次同步推理。仅索引 P50/P90 为 `4.820/5.598 ms`，双输出为 `4.852/5.924 ms`；P50 相差 `0.032 ms`（约 `0.7%`），测量范围分别为 `4.665–7.354 ms` 和 `4.735–6.784 ms`，没有观察到明显双输出开销。两种图的 NPU profiling 都是 142 个任务，且各有一个 TopK/SHAVE 任务；双输出由同一个 TopK 任务生成，不是多执行一次 ArgMax。末端 MatMul/DPU 和 TopK/SHAVE 仍是分开的任务，因此 TopK 没有与前级分类投影融合。
+
+此项只验证了 OpenVINO NPU 插件的编译、推理和单请求耗时，不是整图 OCR E2E；C++ 应用的双输出缓冲读取尚未接入或测量。
+
+#### NPU ArgMax 算子微基准
+
+使用 OpenVINO 2026.4 在 Intel AI Boost 上构造 FP16 `[1,T,18710]` 输入，沿类别轴执行 ArgMax，输出 I64 `[1,T]`。每个宽度预热 8 次、计时 60 次；CPU 对照为同一 FP16 输入的 NumPy `argmax`，NPU 计时为同步 `InferRequest.infer`，包含输入/输出交互和调用开销。各宽度输出索引均与 CPU 完全一致；NPU `query_model` 将 ArgMax 降低为 TopK，并成功编译。
+
+| Rec 桶 | T | CPU NumPy ArgMax P50 | NPU 同步 ArgMax P50 | NPU P90 |
+|---:|---:|---:|---:|---:|
+| W160 | 20 | 1.830 ms | 0.795 ms | 0.818 ms |
+| W320 | 40 | 3.702 ms | 1.007 ms | 1.065 ms |
+| W640 | 80 | 7.394 ms | 1.439 ms | 1.529 ms |
+| W1280 | 160 | 14.963 ms | 1.879 ms | 2.094 ms |
+
+这是随机 FP16 logits 上的独立算子基准，不是实际 CTC 端到端对照；CPU NumPy 也不等于当前 C++ FP16 标量 argmax 实现。它不能直接推算 pipeline 加速比；整图输出、Softmax/ArgMax 与 E2E 对照见上文“Rec 末端后处理四模式对照”。
+
+#### 主机内存带宽对照与测量边界
+
+另用 256 MiB 缓冲区执行主机内存 `Buffer.BlockCopy` 读写测试，12 次取中位数，读写合计吞吐为 **34.8 GB/s**（样本范围 30.7–41.9 GB/s）。本机双通道 DDR5-5600 的理论峰值为 **89.6 GB/s**。这项 BlockCopy 结果是主机侧拷贝基准，不是 NPU 访问 DDR 的带宽，也不是单向纯读带宽。
+
+按 ArgMax 输入张量字节数除以算子延迟，NPU 结果对应约 **0.9–3.2 GB/s** 的有效输入扫描速率；同一算法的 CPU NumPy 结果约 **0.4 GB/s**。这些数值包含 TopK/ArgMax 归约、调度及调用开销，不是内存控制器测得的物理读带宽。ArgMax 在 NPU 上被编译为 SHAVE 上的 TopK，因此它比 CPU 基准快不能单独归因于 SRAM。当前没有 CMX 裸带宽测试，也没有控制数据落在 CMX 或 DDR 的 NPU 读带宽对照；不能用这组 ArgMax 数字与主机 BlockCopy 相除来得出 SRAM/DDR 的速度倍数。
 
 ### Det U8 输入融合实验
 

@@ -598,6 +598,7 @@ struct ProfileMetrics {
     double rec_preprocess_ms = 0.0;
     double rec_submit_ms = 0.0;
     double rec_wait_ms = 0.0;
+    double rec_grid_output_merge_ms = 0.0;
     double rec_pipeline_wall_ms = 0.0;
     double ctc_decode_ms = 0.0;
     double total_end_to_end_ms = 0.0;
@@ -671,6 +672,7 @@ struct ProfileMetrics {
         std::cout << "    Rec normalize                    : " << std::setw(7) << rec_preprocess_ms << " ms\n";
         std::cout << "    Rec submit                       : " << std::setw(7) << rec_submit_ms << " ms\n";
         std::cout << "    Rec wait                         : " << std::setw(7) << rec_wait_ms << " ms\n";
+        std::cout << "    Rec grid output merge/stitch     : " << std::setw(7) << rec_grid_output_merge_ms << " ms\n";
         std::cout << "    Recognition pipeline wall        : " << std::setw(7) << rec_pipeline_wall_ms << " ms (includes recognition detail above)\n";
         std::cout << "    CTC greedy decoding              : " << std::setw(7) << ctc_decode_ms << " ms\n";
         std::cout << "------------------------------------------------------------\n";

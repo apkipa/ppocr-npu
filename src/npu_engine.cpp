@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -944,6 +945,7 @@ void NpuGraph::query_arguments() {
         TensorDesc td;
         td.name = arg.name;
         td.is_input = (arg.type == ZE_GRAPH_ARGUMENT_TYPE_INPUT);
+        td.precision = arg.networkPrecision;
 
         size_t elem_count = 1;
         for (uint32_t d : arg.dims) {
@@ -953,11 +955,52 @@ void NpuGraph::query_arguments() {
             }
         }
 
-        size_t elem_size = 2; // Default FP16
-        if (arg.networkPrecision == ZE_GRAPH_ARGUMENT_PRECISION_FP32) elem_size = 4;
-        else if (arg.networkPrecision == ZE_GRAPH_ARGUMENT_PRECISION_UINT8 || arg.networkPrecision == ZE_GRAPH_ARGUMENT_PRECISION_INT8) elem_size = 1;
-
-        td.total_bytes = elem_count * elem_size;
+        size_t elem_bits = 0;
+        switch (arg.networkPrecision) {
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP64:
+        case ZE_GRAPH_ARGUMENT_PRECISION_INT64:
+        case ZE_GRAPH_ARGUMENT_PRECISION_UINT64:
+            elem_bits = 64;
+            break;
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP32:
+        case ZE_GRAPH_ARGUMENT_PRECISION_INT32:
+        case ZE_GRAPH_ARGUMENT_PRECISION_UINT32:
+            elem_bits = 32;
+            break;
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP16:
+        case ZE_GRAPH_ARGUMENT_PRECISION_BF16:
+        case ZE_GRAPH_ARGUMENT_PRECISION_INT16:
+        case ZE_GRAPH_ARGUMENT_PRECISION_UINT16:
+            elem_bits = 16;
+            break;
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP8_E4M3:
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP8_E5M2:
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP8_E8M0:
+        case ZE_GRAPH_ARGUMENT_PRECISION_INT8:
+        case ZE_GRAPH_ARGUMENT_PRECISION_UINT8:
+            elem_bits = 8;
+            break;
+        case ZE_GRAPH_ARGUMENT_PRECISION_FP4_E2M1:
+        case ZE_GRAPH_ARGUMENT_PRECISION_NF4:
+        case ZE_GRAPH_ARGUMENT_PRECISION_INT4:
+        case ZE_GRAPH_ARGUMENT_PRECISION_UINT4:
+            elem_bits = 4;
+            break;
+        case ZE_GRAPH_ARGUMENT_PRECISION_INT2:
+        case ZE_GRAPH_ARGUMENT_PRECISION_UINT2:
+            elem_bits = 2;
+            break;
+        case ZE_GRAPH_ARGUMENT_PRECISION_BIN:
+        case ZE_GRAPH_ARGUMENT_PRECISION_BOOLEAN:
+            elem_bits = 1;
+            break;
+        default:
+            throw std::runtime_error("Unsupported graph argument precision for '" + td.name + "'");
+        }
+        if (elem_count > (std::numeric_limits<size_t>::max() - 7) / elem_bits) {
+            throw std::overflow_error("Graph argument size overflows size_t for '" + td.name + "'");
+        }
+        td.total_bytes = (elem_count * elem_bits + 7) / 8;
 
         if (td.is_input) {
             inputs_.push_back(td);
