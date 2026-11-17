@@ -19,18 +19,34 @@ Applies the following optimizations:
 """
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
 import struct
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
-import numpy as np
-import openvino as ov
-import openvino.passes as passes
-from openvino.preprocess import ColorFormat, PrePostProcessor
+ov = None
+passes = None
+ColorFormat = None
+PrePostProcessor = None
+
+
+def ensure_openvino():
+    global ov, passes, ColorFormat, PrePostProcessor
+    if ov is None:
+        import openvino as _ov
+        import openvino.passes as _passes
+        from openvino.preprocess import ColorFormat as _ColorFormat, PrePostProcessor as _PrePostProcessor
+
+        ov = _ov
+        passes = _passes
+        ColorFormat = _ColorFormat
+        PrePostProcessor = _PrePostProcessor
 
 
 def package_ngraph_lite(xml_path: Path, bin_path: Path, output_path: Path):
@@ -220,11 +236,92 @@ def compile_npu_blob(xml_path: Path, output_blob_path: Path):
     print(f"  [+] Exported Blob in {(t1 - t0):.2f}s: {output_blob_path.name} ({output_blob_path.stat().st_size / 1024 / 1024:.2f} MB)")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_manifest(
+    output_dir: Path,
+    pack_version: str,
+    det_file: Path,
+    rec_file: Path,
+    dict_file: Path,
+) -> Path:
+    for required in (det_file, rec_file, dict_file):
+        if not required.is_file():
+            raise FileNotFoundError(f"Required runtime model asset missing: {required}")
+
+    manifest_path = output_dir / "manifest.toml"
+    content = (
+        f'pack_format = 1\n'
+        f'pack_version = "{pack_version}"\n'
+        f'\n'
+        f'[det]\n'
+        f'file = "{det_file.name}"\n'
+        f'sha256 = "{file_sha256(det_file)}"\n'
+        f'\n'
+        f'[rec]\n'
+        f'file = "{rec_file.name}"\n'
+        f'sha256 = "{file_sha256(rec_file)}"\n'
+        f'\n'
+        f'[dict]\n'
+        f'file = "{dict_file.name}"\n'
+        f'sha256 = "{file_sha256(dict_file)}"\n'
+    )
+    manifest_path.write_text(content, encoding="utf-8")
+    print(f"  [+] Wrote manifest: {manifest_path.name} (pack_format=1, version={pack_version})")
+    return manifest_path
+
+
+def package_runtime_zip(zip_path: Path, files: list[Path]) -> None:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in files:
+            zf.write(file_path, arcname=file_path.name)
+    print(f"  [+] Packaged release zip: {zip_path} ({zip_path.stat().st_size / 1024 / 1024:.2f} MB)")
+
+
+def resolve_onnx_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
+    det_onnx = args.det_onnx
+    rec_onnx = args.rec_onnx
+    if args.onnx_dir is not None:
+        det_candidates = [
+            args.onnx_dir / "PP-OCRv6_small_det_onnx_infer" / "inference.onnx",
+            args.onnx_dir / "det" / "inference.onnx",
+            args.onnx_dir / "det.onnx",
+        ]
+        rec_candidates = [
+            args.onnx_dir / "PP-OCRv6_small_rec_onnx_infer" / "inference.onnx",
+            args.onnx_dir / "rec" / "inference.onnx",
+            args.onnx_dir / "rec.onnx",
+        ]
+        if det_onnx is None:
+            det_onnx = next((p for p in det_candidates if p.is_file()), None)
+        if rec_onnx is None:
+            rec_onnx = next((p for p in rec_candidates if p.is_file()), None)
+
+    if det_onnx is None or rec_onnx is None:
+        raise SystemExit(
+            "[-] Please specify --onnx-dir <dir> or both --det-onnx <path> and --rec-onnx <path> "
+            "(or pass --manifest-only <runtime_dir> to generate manifest.toml for existing files)."
+        )
+    return det_onnx, rec_onnx
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build and optimize PP-OCRv6 models for Intel NPU")
-    parser.add_argument("--det-onnx", type=Path, default=Path(r"D:\TEMP\npu-experiments\models\PPOCR_v6_baidu_bos\models\PP-OCRv6_small_det_onnx_infer\inference.onnx"), help="Path to original Small Det ONNX")
-    parser.add_argument("--rec-onnx", type=Path, default=Path(r"D:\TEMP\npu-experiments\models\PPOCR_v6_baidu_bos\models\PP-OCRv6_small_rec_onnx_infer\inference.onnx"), help="Path to original Small Rec ONNX")
-    parser.add_argument("--output-dir", type=Path, default=Path("models"), help="Output directory for optimized models")
+    parser.add_argument("--onnx-dir", type=Path, default=None, help="Directory containing raw Det/Rec ONNX subdirectories")
+    parser.add_argument("--det-onnx", type=Path, default=None, help="Path to original Small Det ONNX")
+    parser.add_argument("--rec-onnx", type=Path, default=None, help="Path to original Small Rec ONNX")
+    parser.add_argument("--output-dir", type=Path, default=Path("models/ocr"), help="Clean runtime output directory (only template .ngraph_lite, dict, and manifest.toml)")
+    parser.add_argument("--work-dir", type=Path, default=None, help="Directory for intermediate .xml/.bin/.blob artifacts (defaults to a temporary directory)")
+    parser.add_argument("--pack-version", type=str, default="1.0.0", help="Model pack SemVer written into manifest.toml")
+    parser.add_argument("--pack-zip", type=Path, default=None, help="Optional release zip path containing only the clean runtime files")
+    parser.add_argument("--manifest-only", type=Path, default=None, help="Generate manifest.toml (and optional --pack-zip) for an existing runtime folder without recompiling ONNX")
     parser.add_argument("--det-size", type=int, default=960,
                         help="Detection resolution (default 960 for the default whole-image resize path)")
     parser.add_argument("--det-relu-mul7", action="store_true",
@@ -238,83 +335,118 @@ def main():
                         help="Build the default Rec BGR/NHWC U8 models with model-side preprocessing")
     parser.add_argument("--no-rec-input-u8", dest="rec_input_u8", action="store_false",
                         help="Build FP16 NCHW Rec models instead of U8")
-    parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries for NPU")
+    parser.add_argument("--compile-blobs", action="store_true", help="Compile and export native .blob binaries into --work-dir for NPU")
     parser.add_argument("--no-templates", action="store_true", help="Skip shape template generation (.xml/.bin/.ngraph_lite)")
     args = parser.parse_args()
 
+    det_template_name = "ppocrv6_small_det_u8_template.ngraph_lite" if args.det_input_u8 else "ppocrv6_small_det_template.ngraph_lite"
+    rec_template_name = "ppocrv6_small_rec_u8_template.ngraph_lite" if args.rec_input_u8 else "ppocrv6_small_rec_template.ngraph_lite"
+
+    if args.manifest_only is not None:
+        target_dir = args.manifest_only
+        det_lite = target_dir / det_template_name
+        rec_lite = target_dir / rec_template_name
+        dict_file = target_dir / "ppocr_keys_v1.txt"
+        manifest_path = write_manifest(target_dir, args.pack_version, det_lite, rec_lite, dict_file)
+        if args.pack_zip is not None:
+            package_runtime_zip(args.pack_zip, [manifest_path, det_lite, rec_lite, dict_file])
+        return
+
+    ensure_openvino()
+    det_onnx, rec_onnx = resolve_onnx_inputs(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.det_onnx.exists():
-        print(f"[-] Det ONNX not found at {args.det_onnx}")
+    if not det_onnx.exists():
+        print(f"[-] Det ONNX not found at {det_onnx}")
         sys.exit(1)
-    if not args.rec_onnx.exists():
-        print(f"[-] Rec ONNX not found at {args.rec_onnx}")
+    if not rec_onnx.exists():
+        print(f"[-] Rec ONNX not found at {rec_onnx}")
         sys.exit(1)
 
-    print("==============================================================")
-    print("  PP-OCRv6 Intel NPU Optimization & Model Builder Pipeline    ")
-    print("==============================================================")
-    print(f"  Det ONNX : {args.det_onnx}")
-    print(f"  Rec ONNX : {args.rec_onnx}")
-    print(f"  Output   : {args.output_dir.resolve()}")
-    print(f"  Det Size : {args.det_size}x{args.det_size}")
-    print(f"  Rec Buckets: {[f'48x{w}' for w in args.rec_widths]}")
-    print("==============================================================")
-
-    # 1. Optimize Det Model
-    det_xml, _ = optimize_det_model(args.det_onnx, args.output_dir, size=args.det_size,
-                                    replace_mul7_relu=args.det_relu_mul7,
-                                    input_u8=args.det_input_u8)
-    if args.compile_blobs:
-        det_stem = f"ppocrv6_small_det_u8_{args.det_size}x{args.det_size}" if args.det_input_u8 else f"ppocrv6_small_det_{args.det_size}x{args.det_size}"
-        det_blob = args.output_dir / f"{det_stem}.blob"
-        compile_npu_blob(det_xml, det_blob)
-
-    # 2. Optimize Rec Multi-Buckets
-    print("\n[2/3] Building Optimized Rec Multi-Bucket Models...")
-    for width in args.rec_widths:
-        rec_xml, _ = optimize_rec_bucket(args.rec_onnx, args.output_dir, width=width, remove_softmax=True,
-                                          input_u8=args.rec_input_u8)
-        if args.compile_blobs:
-            stem = f"ppocrv6_small_rec_u8_w{width}" if args.rec_input_u8 else f"ppocrv6_small_rec_w{width}"
-            rec_blob = args.output_dir / f"{stem}.blob"
-            compile_npu_blob(rec_xml, rec_blob)
-
-    # 2b. Shape templates: readable xml/bin for development + single-file NGRAPH_LITE
-    if not args.no_templates:
-        print("\n[2b/3] Building shape templates...")
-        make_shape_template(
-            args.output_dir / (f"ppocrv6_small_det_u8_{args.det_size}x{args.det_size}.xml" if args.det_input_u8 else f"ppocrv6_small_det_{args.det_size}x{args.det_size}.xml"),
-            args.output_dir / ("ppocrv6_small_det_u8_template.xml" if args.det_input_u8 else "ppocrv6_small_det_template.xml"),
-            ["1", "0000", "0000", "3"] if args.det_input_u8 else ["1", "3", "0000", "0000"],
-        )
-        ref_width = 320 if 320 in args.rec_widths else args.rec_widths[0]
-        rec_stem = f"ppocrv6_small_rec_u8_w{ref_width}" if args.rec_input_u8 else f"ppocrv6_small_rec_w{ref_width}"
-        rec_template_name = "ppocrv6_small_rec_u8_template.xml" if args.rec_input_u8 else "ppocrv6_small_rec_template.xml"
-        rec_template_dims = ["1", "0000", "0000", "3"] if args.rec_input_u8 else ["1", "3", "48", "0000"]
-        make_shape_template(args.output_dir / f"{rec_stem}.xml", args.output_dir / rec_template_name, rec_template_dims)
-
-    # 3. Export character dictionary directly from inference.yml
-    dict_dest = args.output_dir / "ppocr_keys_v1.txt"
-    print("\n[3/3] Extracting character dictionary from inference.yml...")
-    rec_yml = args.rec_onnx.parent / "inference.yml"
-    if rec_yml.exists():
-        import yaml
-        with open(rec_yml, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        char_dict = cfg.get("PostProcess", {}).get("character_dict", [])
-        if char_dict:
-            with open(dict_dest, "w", encoding="utf-8") as f:
-                for c in char_dict:
-                    f.write(c + "\n")
-                f.write(" \n")  # Space at the end
-            print(f"  [+] Extracted full multi-language dictionary: {dict_dest.name} ({len(char_dict) + 1} symbols)")
-        else:
-            print("  [-] Warning: character_dict not found in inference.yml")
+    temp_work = None
+    if args.work_dir is not None:
+        work_dir = args.work_dir
+        work_dir.mkdir(parents=True, exist_ok=True)
     else:
-        print(f"  [-] Warning: inference.yml not found at {rec_yml}")
+        temp_work = tempfile.TemporaryDirectory(prefix="ppocr_npu_work_")
+        work_dir = Path(temp_work.name)
 
-    print("\n[V] All optimized NPU models and packages built successfully!")
+    try:
+        print("==============================================================")
+        print("  PP-OCRv6 Intel NPU Optimization & Model Builder Pipeline    ")
+        print("==============================================================")
+        print(f"  Det ONNX : {det_onnx}")
+        print(f"  Rec ONNX : {rec_onnx}")
+        print(f"  Work Dir : {work_dir.resolve()}")
+        print(f"  Runtime  : {args.output_dir.resolve()}")
+        print(f"  Det Size : {args.det_size}x{args.det_size}")
+        print(f"  Rec Buckets: {[f'48x{w}' for w in args.rec_widths]}")
+        print("==============================================================")
+
+        det_xml, _ = optimize_det_model(det_onnx, work_dir, size=args.det_size,
+                                        replace_mul7_relu=args.det_relu_mul7,
+                                        input_u8=args.det_input_u8)
+        if args.compile_blobs:
+            det_stem = f"ppocrv6_small_det_u8_{args.det_size}x{args.det_size}" if args.det_input_u8 else f"ppocrv6_small_det_{args.det_size}x{args.det_size}"
+            compile_npu_blob(det_xml, work_dir / f"{det_stem}.blob")
+
+        print("\n[2/3] Building Optimized Rec Multi-Bucket Models...")
+        for width in args.rec_widths:
+            rec_xml, _ = optimize_rec_bucket(rec_onnx, work_dir, width=width, remove_softmax=True,
+                                             input_u8=args.rec_input_u8)
+            if args.compile_blobs:
+                stem = f"ppocrv6_small_rec_u8_w{width}" if args.rec_input_u8 else f"ppocrv6_small_rec_w{width}"
+                compile_npu_blob(rec_xml, work_dir / f"{stem}.blob")
+
+        det_out_lite = args.output_dir / det_template_name
+        rec_out_lite = args.output_dir / rec_template_name
+
+        if not args.no_templates:
+            print("\n[2b/3] Building shape templates...")
+            make_shape_template(
+                work_dir / (f"ppocrv6_small_det_u8_{args.det_size}x{args.det_size}.xml" if args.det_input_u8 else f"ppocrv6_small_det_{args.det_size}x{args.det_size}.xml"),
+                work_dir / Path(det_template_name).with_suffix(".xml").name,
+                ["1", "0000", "0000", "3"] if args.det_input_u8 else ["1", "3", "0000", "0000"],
+            )
+            shutil.copyfile(work_dir / det_template_name, det_out_lite)
+
+            ref_width = 320 if 320 in args.rec_widths else args.rec_widths[0]
+            rec_stem = f"ppocrv6_small_rec_u8_w{ref_width}" if args.rec_input_u8 else f"ppocrv6_small_rec_w{ref_width}"
+            rec_template_xml = Path(rec_template_name).with_suffix(".xml").name
+            rec_template_dims = ["1", "0000", "0000", "3"] if args.rec_input_u8 else ["1", "3", "48", "0000"]
+            make_shape_template(work_dir / f"{rec_stem}.xml", work_dir / rec_template_xml, rec_template_dims)
+            shutil.copyfile(work_dir / rec_template_name, rec_out_lite)
+
+        dict_dest = args.output_dir / "ppocr_keys_v1.txt"
+        print("\n[3/3] Extracting character dictionary from inference.yml...")
+        rec_yml = rec_onnx.parent / "inference.yml"
+        if rec_yml.exists():
+            import yaml
+            with open(rec_yml, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            char_dict = cfg.get("PostProcess", {}).get("character_dict", [])
+            if char_dict:
+                with open(dict_dest, "w", encoding="utf-8") as f:
+                    for c in char_dict:
+                        f.write(c + "\n")
+                    f.write(" \n")
+                print(f"  [+] Extracted full multi-language dictionary: {dict_dest.name} ({len(char_dict) + 1} symbols)")
+            else:
+                print("  [-] Warning: character_dict not found in inference.yml")
+        else:
+            print(f"  [-] Warning: inference.yml not found at {rec_yml}")
+
+        if not args.no_templates and dict_dest.is_file():
+            manifest_path = write_manifest(
+                args.output_dir, args.pack_version, det_out_lite, rec_out_lite, dict_dest,
+            )
+            if args.pack_zip is not None:
+                package_runtime_zip(args.pack_zip, [manifest_path, det_out_lite, rec_out_lite, dict_dest])
+
+        print("\n[V] All optimized NPU models and packages built successfully!")
+    finally:
+        if temp_work is not None:
+            temp_work.cleanup()
 
 
 if __name__ == "__main__":
