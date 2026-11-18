@@ -1,5 +1,9 @@
 # PP-OCRv6 on Intel NPU (Level Zero Native C++)
 
+> [!WARNING]
+> 本项目由 AI 编写：源码、脚本与文档均为 AI 生成，未经逐行人工审查。
+> 不保证正确性、安全性与稳定性；请自行审计后再使用，不建议直接用于生产环境。
+
 专为 **Intel Core Ultra（Arrow Lake / Meteor Lake）NPU 硬件架构** 深度定制的高性能 PP-OCRv6 纯血 C++ 推理引擎与离线模型优化流水线。
 
 结合 Intel Level Zero 原生运行时、统一共享内存（USM 零拷贝）、Windows 原生 WIC 解码器与大图切片概率图拼接，实现低搬运开销的 NPU 推理。
@@ -271,4 +275,4 @@ uv run python scripts/evaluate.py --models-dir models/ --output-json benchmark_r
 
 ## 📄 License
 
-本项目基于 Apache 2.0 许可证开源。模型权重归属百度飞桨 PaddleOCR 团队所有。
+模型权重归属百度飞桨 PaddleOCR 团队所有。
